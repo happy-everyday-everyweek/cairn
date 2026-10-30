@@ -1,12 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Cairn</string>
-    <string name="fingerprint">This device: %1$s</string>
-    <string name="ready">Channel ready. This device: %1$s</string>
-    <string name="hint_peer">Peer address, for example 192.168.1.42</string>
-    <string name="hint_message">Message to send</string>
-    <string name="action_discover">Discover</string>
-    <string name="action_connect">Connect</string>
+    <string name="status_idle">Not paired. This device: %1$s</string>
+    <string name="status_ready">Paired. This device: %1$s</string>
+    <string name="hint_code">Six digit code, same on both phones</string>
+    <string name="action_pair">Pair</string>
     <string name="action_send">Send</string>
     <string name="action_file">Send file</string>
 </resources>

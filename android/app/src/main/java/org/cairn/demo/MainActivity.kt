@@ -1,102 +1,116 @@
 package org.cairn.demo
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.method.ScrollingMovementMethod
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.nio.charset.StandardCharsets
 
 /**
- * Minimal demonstration activity: discovery, handshake, chat and file transfer
- * between two phones on the same network.
+ * The demo: type a code on two phones, tap Pair, then send text or a file.
  *
- * This class is deliberately plain. It builds its views in code so the demo needs
- * no layout resources, and it keeps every protocol decision in the native library.
- * What is left here is button wiring and log output, which is exactly what an
- * application layer should have to write.
+ * Everything protocol shaped is one native call. What is left here is a code field, a
+ * log view, two worker threads (one to pair, one to pump), and a multicast lock, which
+ * some devices need before they will deliver broadcast packets to an app.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var logView: TextView
-    private lateinit var peerField: EditText
-    private lateinit var messageField: EditText
+    private lateinit var codeField: EditText
     private lateinit var statusView: TextView
 
     private var handle = 0L
-    private var transport: UdpTransport? = null
-    private val ui = Handler(Looper.getMainLooper())
+    private var worker: Thread? = null
+    @Volatile private var running = false
 
-    private val stateOut = IntArray(2)
-    private var peerHost: String? = null
-    private var peerPort = 0
+    private val ui = Handler(Looper.getMainLooper())
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    private val eventSink = object {
+        @Suppress("unused")
+        fun onMessage(data: ByteArray) {
+            print("message: ${String(data, StandardCharsets.UTF_8)}")
+        }
+
+        @Suppress("unused")
+        fun onChunk(index: Int, data: ByteArray) {
+            print("chunk $index (${data.size} bytes)")
+        }
+
+        @Suppress("unused")
+        fun onReady() {
+            print("paired")
+            ui.post { statusView.text = getString(R.string.status_ready) }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(buildUi())
+        takeMulticastLock()
 
-        handle = CairnNative.nativeCreate(deviceName(), PORT)
+        handle = Cairn.nativeOpen(deviceName(), eventSink)
         if (handle == 0L) {
-            finish()
+            print("cannot open a node")
             return
         }
-
-        setContentView(buildUi())
-        statusView.text = getString(R.string.fingerprint, CairnNative.nativeFingerprint(handle))
-        startTransport()
+        statusView.text = getString(R.string.status_idle, Cairn.nativeFingerprint(handle))
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        transport?.stop()
-        transport = null
+        running = false
+        worker?.interrupt()
+        worker = null
         if (handle != 0L) {
-            CairnNative.nativeDestroy(handle)
+            Cairn.nativeClose(handle)
             handle = 0L
         }
+        multicastLock?.release()
+        multicastLock = null
     }
 
-    private fun buildUi(): ScrollView {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    private fun buildUi(): LinearLayout {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 48, 32, 32)
+        }
 
-        statusView = TextView(this).apply {
-            setPadding(32, 32, 32, 16)
-            textSize = 16f
-        }
-        logView = TextView(this).apply {
-            setPadding(32, 16, 32, 16)
-            textSize = 12f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        peerField = EditText(this).apply {
-            hint = getString(R.string.hint_peer)
-            setSingleLine()
-        }
-        messageField = EditText(this).apply {
-            hint = getString(R.string.hint_message)
+        statusView = TextView(this).apply { textSize = 15f }
+
+        codeField = EditText(this).apply {
+            hint = getString(R.string.hint_code)
             setSingleLine()
         }
 
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        buttons.addView(button(R.string.action_discover) { discover() })
-        buttons.addView(button(R.string.action_connect) { connect() })
-        buttons.addView(button(R.string.action_send) { sendMessage() })
+        buttons.addView(button(R.string.action_pair) { startPairing() })
+        buttons.addView(button(R.string.action_send) { sendText() })
         buttons.addView(button(R.string.action_file) { sendFile() })
 
+        logView = TextView(this).apply {
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            movementMethod = ScrollingMovementMethod()
+        }
+
         root.addView(statusView)
-        root.addView(peerField)
-        root.addView(messageField)
+        root.addView(codeField)
         root.addView(buttons)
         root.addView(logView)
-        return ScrollView(this).apply { addView(root) }
+        return root
     }
 
-    private fun button(labelRes: Int, action: () -> Unit): Button =
+    private fun button(label: Int, action: () -> Unit): Button =
         Button(this).apply {
-            text = getString(labelRes)
+            text = getString(label)
             setOnClickListener { action() }
         }
 
@@ -104,122 +118,95 @@ class MainActivity : AppCompatActivity() {
         ui.post { logView.append("$line\n") }
     }
 
-    private fun startTransport() {
-        val t = UdpTransport(
-            port = PORT,
-            onFrame = { bytes -> onDatagram(bytes) },
-            onError = { message -> print("error: $message") }
-        )
-        try {
-            t.start()
-        } catch (e: Exception) {
-            print("cannot bind udp $PORT: ${e.message}")
-            return
+    private fun takeMulticastLock() {
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return
+        multicastLock = wifi.createMulticastLock("cairn").apply {
+            setReferenceCounted(false)
+            acquire()
         }
-        transport = t
-        print("udp ${t.localPort} ready")
-    }
-
-    /** Every datagram is either a beacon or a frame; the library decides which. */
-    private fun onDatagram(bytes: ByteArray) {
-        val now = CairnNative.nativeTimeMs().toInt()
-
-        val peer = runCatching { CairnNative.nativeOnBeacon(handle, bytes, now) }.getOrNull()
-        if (peer != null) {
-            print("beacon: ${peer[0]} ${peer[1].take(8)}...:${peer[2]}")
-            peerPort = peer[2].toIntOrNull() ?: PORT
-            replyWithKey(peerHost ?: "255.255.255.255", peerPort)
-            return
-        }
-
-        val reply = CairnNative.nativeOnFrame(handle, bytes, now, stateOut)
-        if (stateOut[0] != CairnNative.OK) {
-            print("frame rejected: ${CairnNative.nativeStatusString(stateOut[0])}")
-            return
-        }
-        if (stateOut[1] == 1 && !readyShown) {
-            readyShown = true
-            ui.post {
-                statusView.text =
-                    getString(R.string.ready, CairnNative.nativeFingerprint(handle))
-            }
-        }
-        reply?.let { sendRaw(it) }
-        CairnNative.nativeTakeMessage(handle)?.let {
-            print("message: ${String(it, StandardCharsets.UTF_8)}")
-        }
-    }
-
-    private var readyShown = false
-
-    private fun replyWithKey(host: String, port: Int) {
-        val key = CairnNative.nativeAnnounceKey(handle, CairnNative.nativeTimeMs().toInt())
-        key?.let { transport?.send(it, host, port) }
-    }
-
-    private fun sendRaw(frame: ByteArray) {
-        val host = peerHost ?: return
-        transport?.send(frame, host, peerPort)
-    }
-
-    private fun discover() {
-        val beacon = CairnNative.nativeBeacon(handle) ?: return
-        transport?.broadcast(beacon, PORT)
-        print("beacon broadcast")
-    }
-
-    private fun connect() {
-        val host = peerField.text?.toString()?.trim().orEmpty()
-        if (host.isEmpty()) {
-            print("enter the peer address first")
-            return
-        }
-        peerHost = host
-        if (peerPort == 0) peerPort = PORT
-        replyWithKey(host, peerPort)
-    }
-
-    private fun sendMessage() {
-        val text = messageField.text?.toString().orEmpty()
-        if (text.isEmpty()) return
-        val frame = CairnNative.nativeSend(handle, text.toByteArray(StandardCharsets.UTF_8))
-        if (frame == null) {
-            print("channel not ready")
-            return
-        }
-        sendRaw(frame)
-        messageField.setText("")
     }
 
     /**
-     * Streams a synthetic 64 KiB file so the transfer path is exercised without
-     * needing storage permission. A real application would read from a stream.
+     * Pairing blocks, so it runs off the UI thread. Once it returns, the same thread
+     * keeps calling poll, which is where the callbacks fire.
      */
-    private fun sendFile() {
-        val total = 64L * 1024L
-        val meta = CairnNative.nativeOfferFile(handle, total) ?: run {
-            print("channel not ready")
+    private fun startPairing() {
+        if (handle == 0L || running) return
+
+        val code = codeField.text?.toString()?.trim().orEmpty()
+        if (code.length < 4) {
+            print("enter at least four digits")
             return
         }
-        sendRaw(meta)
 
-        val payload = ByteArray(CHUNK) { (it % 251).toByte() }
-        val indexOut = IntArray(1)
+        running = true
+        worker = Thread {
+            print("pairing with $code")
+            val rc = Cairn.nativePair(handle, code, PAIR_TIMEOUT_MS)
+            if (rc != Cairn.OK) {
+                print("pairing failed: ${Cairn.nativeError(rc)}")
+                running = false
+                return@Thread
+            }
+            print("paired, waiting for traffic")
+            ui.post { statusView.text = getString(R.string.status_ready) }
+
+            while (running) {
+                Cairn.nativePoll(handle, POLL_SLICE_MS)
+            }
+        }.also { it.name = "cairn-pair"; it.start() }
+    }
+
+    private fun sendText() {
+        if (!pairReady()) return
+        val rc = Cairn.nativeSend(handle, "hello from cairn".toByteArray(StandardCharsets.UTF_8))
+        print(if (rc == Cairn.OK) "sent" else "send failed: ${Cairn.nativeError(rc)}")
+    }
+
+    /**
+     * Sends a synthetic file so the transfer path can be exercised without asking for
+     * storage permission. A real app would read from a stream here.
+     */
+    private fun sendFile() {
+        if (!pairReady()) return
+
+        val total = FILE_BYTES
+        val rc = Cairn.nativeSendFile(handle, total)
+        if (rc != Cairn.OK) {
+            print("offer failed: ${Cairn.nativeError(rc)}")
+            return
+        }
+
+        val chunk = ByteArray(CHUNK_BYTES) { (it % 251).toByte() }
         var guard = 0
         while (guard++ < 64) {
-            val chunk = CairnNative.nativeNextChunk(handle, payload, indexOut) ?: break
-            sendRaw(chunk)
-            print("chunk ${indexOut[0]}, ${CairnNative.nativeTransferProgress(handle)} confirmed")
-            if (CairnNative.nativeTransferComplete(handle)) break
+            val sent = Cairn.nativeSendChunk(handle, chunk, CHUNK_TIMEOUT_MS)
+            if (sent != Cairn.OK) {
+                print("chunk failed: ${Cairn.nativeError(sent)}")
+                return
+            }
+            print("progress ${Cairn.nativeProgress(handle)}%")
+            if (Cairn.nativeTransferDone(handle)) break
         }
-        val done = CairnNative.nativeTransferComplete(handle)
-        print("transfer ${if (done) "complete" else "incomplete"}")
+        print("transfer ${if (Cairn.nativeTransferDone(handle)) "complete" else "incomplete"}")
+    }
+
+    private fun pairReady(): Boolean {
+        if (handle == 0L || !Cairn.nativeReady(handle)) {
+            print("not paired yet")
+            return false
+        }
+        return true
     }
 
     private fun deviceName(): String = android.os.Build.MODEL?.take(24) ?: "android"
 
     private companion object {
-        const val PORT = 9400
-        const val CHUNK = 16 * 1024
+        const val PAIR_TIMEOUT_MS = 30_000
+        const val POLL_SLICE_MS = 200
+        const val FILE_BYTES = 64L * 1024L
+        const val CHUNK_BYTES = 16 * 1024
+        const val CHUNK_TIMEOUT_MS = 5_000
     }
 }

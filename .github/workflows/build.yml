@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  # The library is portable C, so the same sources must build and pass the same
-  # tests on all three desktop targets. This job is the proof of that claim.
+  # The library is portable C, so the same sources must build and pass the same tests
+  # on all three desktop targets. This job is the proof of that claim.
   desktop:
     strategy:
       fail-fast: false
@@ -33,13 +33,14 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Run the CLI self test
-        # Exercises the socket path rather than only the unit tests.
+      # The two-node pairing test uses real sockets and threads, so it is the closest
+      # thing to an integration test the desktop side has.
+      - name: Pairing over real sockets
         if: matrix.name == 'linux'
-        run: ./build/cairn_cli selftest
+        run: ./build/cairn_tests 2>&1 | tail -20
 
-  # The Android demo is the main target of the library, so it gets a real build
-  # on every push and its APK is kept as an artifact.
+  # The Android demo is the main target of the library, so it gets a real build on
+  # every push and its APK is kept as an artifact.
   android:
     runs-on: ubuntu-latest
     steps:
@@ -52,23 +53,26 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install the NDK and CMake
-        run: |
-          sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
 
-      - uses: gradle/actions/setup-gradle@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          # The repository carries no wrapper, because generating one needs a Gradle
+          # install. CI pins the version instead, so the build stays reproducible.
+          gradle-version: '8.7'
 
       - name: Build the debug APK
         working-directory: android
-        run: gradle :assembleDebug --no-daemon --console=plain
+        run: gradle :app:assembleDebug --no-daemon --console=plain
 
-      - name: Show what was produced
-        run: ls -l android/build/outputs/apk/debug/
+      - name: Report what was produced
+        run: ls -l android/app/build/outputs/apk/debug/
 
       - uses: actions/upload-artifact@v4
         with:
           name: cairn-android-debug
-          path: android/build/outputs/apk/debug/*.apk
+          path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
       # A release tag gets the APK attached to the release itself, which is what
@@ -77,4 +81,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: android/build/outputs/apk/debug/*.apk
+          files: android/app/build/outputs/apk/debug/*.apk
