@@ -1,0 +1,80 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The library is portable C, so the same sources must build and pass the same
+  # tests on all three desktop targets. This job is the proof of that claim.
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Run the CLI self test
+        # Exercises the socket path rather than only the unit tests.
+        if: matrix.name == 'linux'
+        run: ./build/cairn_cli selftest
+
+  # The Android demo is the main target of the library, so it gets a real build
+  # on every push and its APK is kept as an artifact.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the NDK and CMake
+        run: |
+          sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Build the debug APK
+        working-directory: android
+        run: gradle :assembleDebug --no-daemon --console=plain
+
+      - name: Show what was produced
+        run: ls -l android/build/outputs/apk/debug/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cairn-android-debug
+          path: android/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # A release tag gets the APK attached to the release itself, which is what
+      # someone installing it actually needs.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android/build/outputs/apk/debug/*.apk

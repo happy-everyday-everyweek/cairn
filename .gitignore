@@ -1,0 +1,32 @@
+# Build output
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Android
+android/.gradle/
+android/build/
+android/local.properties
+android/.idea/
+.gradle/
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Editor and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local identity file the CLI creates
+.cairn-identity
+
+# Agent backup directory
+.backup/
