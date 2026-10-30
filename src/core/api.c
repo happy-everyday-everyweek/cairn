@@ -55,7 +55,8 @@ struct cairn_node {
     cairn_identity identity;
     cairn_io io;
 
-    int fd;
+    int fd;          /* data: ephemeral port */
+    int beacon_fd;   /* discovery: fixed port, shared */
     struct sockaddr_in peer_addr;
     int have_peer_addr;
 
@@ -94,20 +95,45 @@ static int transmit(cairn_node *n, const void *data, size_t len)
     return raw_send_to(n, data, len, &n->peer_addr);
 }
 
-static int beacon_broadcast(cairn_node *n)
+/* Sends our beacon out.
+ *
+ * Two destinations, because one is not enough:
+ *
+ *   the discovery port, so a device that has never heard of us can find us. That is
+ *   the address a listener binds.
+ *   the peer we last heard from, so a device that is already talking to us keeps
+ *   receiving even when broadcast is filtered, which is the normal case on a phone
+ *   with several interfaces and the only case that works on loopback.
+ *
+ * Sending to the remembered peer directly is what makes two instances on one machine
+ * find each other: both broadcast, both hear nothing useful on loopback, but each has
+ * the other's address from the packets that did arrive.
+ */
+static void beacon_broadcast(cairn_node *n)
 {
     uint8_t buf[CAIRN_BEACON_MAX];
     size_t len = 0;
     struct sockaddr_in dst;
 
-    if (cairn_engine_beacon(&n->engine, buf, sizeof buf, &len) != CAIRN_OK)
-        return CAIRN_ERR_STATE;
+    if (cairn_engine_beacon(&n->engine, buf, sizeof buf, &len) != CAIRN_OK) return;
 
     memset(&dst, 0, sizeof dst);
     dst.sin_family = AF_INET;
     dst.sin_port = htons(DISCOVERY_PORT);
-    dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    return raw_send_to(n, buf, len, &dst);
+
+    /* Broadcast on the subnet, and on loopback so two processes on one machine can
+     * find each other. Both go through the discovery socket, which is the one bound to
+     * the port a listener is watching. */
+    if (n->beacon_fd >= 0) {
+        dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
+    }
+
+    /* And straight to the peer we already know, which is the reliable path once a
+     * conversation has started. */
+    if (n->have_peer_addr) (void)raw_send_to(n, buf, len, &n->peer_addr);
 }
 
 static int first_ready_index(const cairn_node *n)
@@ -149,7 +175,8 @@ static void deliver_pending(cairn_node *n)
     }
 }
 
-/* Reads at most one datagram and feeds it in. A timeout is not an error here. */
+/* Drains both sockets, feeding everything into the engine. A timeout is not an
+ * error here: an empty queue just means there was nothing to do this pass. */
 static void pump_once(cairn_node *n)
 {
     uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
@@ -159,30 +186,70 @@ static void pump_once(cairn_node *n)
     cairn_engine_outbox reply;
     cairn_frame f;
     size_t used = 0;
-    int rc;
+    int pass;
 
     if (n->fd < 0) return;
 
-    got = recvfrom(n->fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
-    if (got <= 0) return;
+    for (pass = 0; pass < 8; pass++) {
+        int handled = 0;
 
-    remember_peer_addr(n, &from);
+        if (n->beacon_fd >= 0) {
+            got = recvfrom(n->beacon_fd, buf, sizeof buf, MSG_DONTWAIT,
+                           (struct sockaddr *)&from, &fromlen);
+            if (got > 0) {
+                cairn_beacon b;
+                handled = 1;
 
-    /* A beacon carries a different magic and no checksum, so it is easy to tell
-     * apart from a frame. */
-    if ((size_t)got >= 4 && buf[0] == BEACON_MAGIC0 && buf[1] == BEACON_MAGIC1) {
-        cairn_beacon b;
-        if (cairn_beacon_decode(&b, buf, (size_t)got) == CAIRN_OK)
-            cairn_engine_on_beacon(&n->engine, buf, (size_t)got, now_ms());
-        return;
+                if (cairn_beacon_decode(&b, buf, (size_t)got) == CAIRN_OK &&
+                    memcmp(b.id, n->engine.beacon.id, CAIRN_ID_BYTES) != 0) {
+                    /* Answer on the port the beacon advertises, which is where that
+                     * device's data socket lives, not the discovery port. */
+                    from.sin_port = htons(b.port);
+                    remember_peer_addr(n, &from);
+                    cairn_engine_on_beacon(&n->engine, buf, (size_t)got, now_ms());
+                }
+                /* A beacon from ourselves is dropped whole, address included. Recording
+                 * our own sender address here pointed every later KEY and HELLO frame at
+                 * our own socket, which is why two nodes on one machine sometimes ended
+                 * up with a peer slot for themselves and never completed a handshake. */
+            }
+        }
+
+        got = recvfrom(n->fd, buf, sizeof buf, MSG_DONTWAIT,
+                       (struct sockaddr *)&from, &fromlen);
+        if (got > 0) {
+            handled = 1;
+
+            /* A beacon reaches this socket too, because we broadcast from it. When that
+             * happens the sender port is the peer's discovery socket, not the data port
+             * we must answer on, so the advertised port has to replace it. Remembering
+             * the raw sender address here was a real bug: KEY and HELLO frames then went
+             * to port 4242, and pairing worked only when a beacon happened to arrive on
+             * the other socket instead. */
+            if ((size_t)got >= 4 && buf[0] == BEACON_MAGIC0 && buf[1] == BEACON_MAGIC1) {
+                cairn_beacon b;
+                /* Self beacons are dropped before the address is recorded, for the
+                 * reason given above. */
+                if (cairn_beacon_decode(&b, buf, (size_t)got) == CAIRN_OK &&
+                    memcmp(b.id, n->engine.beacon.id, CAIRN_ID_BYTES) != 0) {
+                    from.sin_port = htons(b.port);
+                    remember_peer_addr(n, &from);
+                    cairn_engine_on_beacon(&n->engine, buf, (size_t)got, now_ms());
+                }
+            } else {
+                remember_peer_addr(n, &from);
+            }
+
+            if (cairn_frame_decode(&f, &used, buf, (size_t)got) == CAIRN_OK) {
+                memset(&reply, 0, sizeof reply);
+                if (cairn_engine_on_frame(&n->engine, &f, now_ms(), &reply) == CAIRN_OK &&
+                    reply.len > 0)
+                    transmit(n, reply.buf, reply.len);
+            }
+        }
+
+        if (!handled) break;
     }
-
-    if (cairn_frame_decode(&f, &used, buf, (size_t)got) != CAIRN_OK) return;
-
-    memset(&reply, 0, sizeof reply);
-    rc = cairn_engine_on_frame(&n->engine, &f, now_ms(), &reply);
-    if (rc != CAIRN_OK) return;
-    if (reply.len > 0) transmit(n, reply.buf, reply.len);
 }
 
 /* ------------------------------------------------------------------ life */
@@ -209,42 +276,84 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
     }
 
     n->io = *io;
+    n->fd = -1;
+    n->beacon_fd = -1;
+
+    /* Two sockets, because beacons and data have different addressing needs.
+     *
+     *   fd        an ephemeral port. Everything after discovery goes here, addressed
+     *             to whoever we last heard from.
+     *   beacon_fd the fixed discovery port, shared with SO_REUSEPORT so several
+     *             instances on one machine can all receive beacons.
+     *
+     * Without the second socket a beacon addressed to the discovery port lands nowhere,
+     * which is exactly the bug this arrangement exists to prevent.
+     */
     n->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (n->fd < 0) {
-        cairn_engine_clear(&n->engine);
-        cairn_identity_clear(&n->identity);
-        free(n);
-        return NULL;
-    }
+    if (n->fd < 0) goto fail;
+    n->beacon_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (n->beacon_fd < 0) goto fail;
 
     {
         int one = 1;
-        setsockopt(n->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        setsockopt(n->fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
         tv.tv_sec = 0;
         tv.tv_usec = POLL_SLICE_MS * 1000;
+
+        setsockopt(n->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(n->fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
         setsockopt(n->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+#ifdef SO_REUSEPORT
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+#endif
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     }
 
     memset(&bind_addr, 0, sizeof bind_addr);
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind_addr.sin_port = 0;
-    if (bind(n->fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) {
-        close(n->fd);
-        cairn_engine_clear(&n->engine);
-        cairn_identity_clear(&n->identity);
-        free(n);
-        return NULL;
+    if (bind(n->fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) goto fail;
+
+    /* The discovery socket needs the fixed port. If it is taken by a process that did
+     * not set SO_REUSEPORT, discovery still works one way: we keep broadcasting and
+     * answering whatever arrives on the data socket.
+     */
+    bind_addr.sin_port = htons(DISCOVERY_PORT);
+    if (bind(n->beacon_fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) {
+        close(n->beacon_fd);
+        n->beacon_fd = -1;
+    }
+
+    /* The beacon must advertise the data port, not the discovery port: that is where a
+     * peer should send HELLO once it has seen us. */
+    {
+        struct sockaddr_in self;
+        socklen_t selflen = sizeof self;
+        if (getsockname(n->fd, (struct sockaddr *)&self, &selflen) == 0) {
+            n->engine.beacon.port = ntohs(self.sin_port);
+            n->engine.port = ntohs(self.sin_port);
+        }
     }
 
     return n;
+
+fail:
+    if (n->fd >= 0) close(n->fd);
+    if (n->beacon_fd >= 0) close(n->beacon_fd);
+    cairn_engine_clear(&n->engine);
+    cairn_identity_clear(&n->identity);
+    free(n);
+    return NULL;
 }
 
 void cairn_close(cairn_node *n)
 {
     if (n == NULL) return;
     if (n->fd >= 0) close(n->fd);
+    if (n->beacon_fd >= 0) close(n->beacon_fd);
     cairn_engine_clear(&n->engine);
     cairn_identity_clear(&n->identity);
     cairn_memzero(n->code, sizeof n->code);
@@ -302,19 +411,86 @@ static int take_code(cairn_node *n, const char *code)
     return CAIRN_OK;
 }
 
-/* The confirmation label carries the code. Both sides derive the tag from their
- * own code, so a mismatch makes the tags differ and the engine rejects the
- * handshake with CAIRN_ERR_AUTH. That is the whole security of pairing, and it is
- * why this needs no UI on either side beyond showing the digits. */
-/* Waits for any peer to finish handshaking. A wrong code shows up here as a peer
- * that never reaches READY, which is why the timeout is the caller's. */
-static int await_ready(cairn_node *n, uint32_t deadline)
+/* Pairs this node with whoever else is using the same code.
+ *
+ * The sequence is the same one the engine tests drive by hand, only here the socket
+ * and the clock do the driving:
+ *
+ *   1. broadcast a beacon so the other side learns we exist
+ *   2. on seeing a peer, answer with our full public key (a beacon is too small)
+ *   3. once we hold the peer's key, the side with the lower code digit value sends
+ *      HELLO, and the other waits for it, so both never initiate at once
+ *   4. the handshake's confirmation tags carry the code, so a mismatch fails here
+ *
+ * Step 3 is the part that makes two identical calls on two devices converge: both
+ * compute the same comparison from the same digits and pick opposite roles without
+ * exchanging another message.
+ */
+static int pair_loop(cairn_node *n, uint32_t deadline)
 {
+    uint32_t last_beacon = 0;
+    uint32_t last_key = 0;
+    uint32_t last_hello = 0;
+
     while ((int32_t)(deadline - now_ms()) > 0) {
-        (void)beacon_broadcast(n);
+        cairn_engine_outbox out;
+        int i;
+
+        /* Beacons go out about three times a second rather than every pass.
+         * Broadcasting on every iteration floods the peer's receive queue with beacons
+         * and starves the KEY and HELLO frames that actually matter. */
+        if (last_beacon == 0 || (uint32_t)(now_ms() - last_beacon) > 300) {
+            beacon_broadcast(n);
+            last_beacon = now_ms();
+        }
+
         pump_once(n);
         deliver_pending(n);
+
+        if (any_ready(n)) return CAIRN_OK;
+
+        /* Everything below is decided from the state that exists right now, with no
+         * counters carried between passes. That matters: an earlier version tracked
+         * "already announced" and "already started", so one lost datagram left those
+         * flags set and the attempt could never be retried. Pairing then worked only
+         * when the first try happened to land, which is worse than never working
+         * because it looks like a timing flake.
+         */
+        for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++) {
+            cairn_engine_peer *p = &n->engine.peers[i];
+            cairn_pair_view view;
+
+            /* The decision is a pure function so it can be checked without a socket;
+             * this loop only supplies the facts and performs the action. */
+            view.peer_state = (int)p->state;
+            view.has_key = p->has_key;
+            view.we_initiate = memcmp(n->engine.beacon.id, p->id, CAIRN_ID_BYTES) < 0;
+            view.key_due = (last_key == 0 || (uint32_t)(now_ms() - last_key) > 400);
+            view.hello_due = (last_hello == 0 || (uint32_t)(now_ms() - last_hello) > 600);
+
+            switch (cairn_pair_next(&view)) {
+            case CAIRN_PAIR_SEND_KEY:
+                memset(&out, 0, sizeof out);
+                if (cairn_engine_announce_key(&n->engine, p->id, &out) == CAIRN_OK &&
+                    out.len > 0)
+                    (void)transmit(n, out.buf, out.len);
+                last_key = now_ms();
+                break;
+
+            case CAIRN_PAIR_SEND_HELLO:
+                memset(&out, 0, sizeof out);
+                if (cairn_engine_connect(&n->engine, p->id, now_ms(), &out) == CAIRN_OK)
+                    (void)transmit(n, out.buf, out.len);
+                last_hello = now_ms();
+                break;
+
+            case CAIRN_PAIR_IDLE:
+            default:
+                break;
+            }
+        }
     }
+
     return any_ready(n) ? CAIRN_OK : CAIRN_ERR_TIMEOUT;
 }
 
@@ -326,22 +502,20 @@ int cairn_pair_wait(cairn_node *n, const char *code, uint32_t timeout_ms)
     rc = take_code(n, code);
     if (rc != CAIRN_OK) return rc;
 
-    /* Pairing is symmetric: this device announces itself and answers whoever
-     * arrives. It does not need to know an address. */
-    return await_ready(n, now_ms() + timeout_ms);
+    /* The code must reach the engine, which puts it into the handshake labels. Without
+     * this the tags are computed from the bare phase name and any code would connect. */
+    rc = cairn_engine_set_code(&n->engine, n->code);
+    if (rc != CAIRN_OK) return rc;
+
+    return pair_loop(n, now_ms() + timeout_ms);
 }
 
 int cairn_pair_join(cairn_node *n, const char *code, uint32_t timeout_ms)
 {
-    int rc;
-
-    if (n == NULL) return CAIRN_ERR_ARG;
-    rc = take_code(n, code);
-    if (rc != CAIRN_OK) return rc;
-
-    /* Same work as waiting. The engine decides which side initiates based on what
-     * it hears, so the two calls differ only in intent, not in behaviour. */
-    return await_ready(n, now_ms() + timeout_ms);
+    /* Deliberately identical to waiting. Which side sends HELLO is decided by the
+     * code comparison inside pair_loop, not by who called which function, so two
+     * applications never have to agree on roles. */
+    return cairn_pair_wait(n, code, timeout_ms);
 }
 
 int cairn_poll(cairn_node *n, uint32_t timeout_ms)

@@ -81,6 +81,9 @@ typedef struct {
     uint8_t chunk_plain[CAIRN_CHUNK_BYTES];
     size_t chunk_plain_len;
     uint32_t chunk_index;
+    /* Set once a KEY frame has filled in the peer's full public key. A slot created
+     * from a beacon alone has no key and cannot be handshaked against. */
+    int has_key;
     /* The pairing code bound into the handshake, as digits. Zero means none, in
      * which case the labels fall back to their bare form. */
     char code[13];
@@ -154,7 +157,35 @@ int cairn_engine_offer_file(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTE
 int cairn_engine_pump_transfer(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
                              const void *chunk, size_t len, cairn_engine_outbox *out);
 
-int cairn_engine_peer_status( const cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES]);
+int cairn_engine_peer_status(const cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES]);
+
+/* ---------------------------------------------------------- pairing decisions
+ *
+ * What the facade should do for one peer, decided purely from facts so it can be
+ * checked exhaustively without a socket or a clock.
+ *
+ * The logic that used to sit inside cairn_pair_wait was tangled with timers and
+ * file descriptors, and every bug in it lived in the branching rather than in the
+ * I/O: a flag carried across passes made a lost datagram unrecoverable, and a
+ * missing "do we hold their key" check deadlocked both sides. Pulling the decision
+ * out makes those cases a table.
+ */
+typedef enum {
+    CAIRN_PAIR_IDLE = 0,     /* nothing to do this pass */
+    CAIRN_PAIR_SEND_KEY,     /* we still lack their key, so send ours */
+    CAIRN_PAIR_SEND_HELLO    /* both keys held, and we are the initiator */
+} cairn_pair_action;
+
+typedef struct {
+    int peer_state;   /* a cairn_engine_peer_state_t value */
+    int has_key;      /* we hold the peer's full public key */
+    int we_initiate;  /* our device id sorts lower, so HELLO is ours to send */
+    int key_due;      /* the key retransmit timer has elapsed */
+    int hello_due;    /* the HELLO retransmit timer has elapsed */
+} cairn_pair_view;
+
+/* Returns what to send for this peer, or IDLE. */
+cairn_pair_action cairn_pair_next(const cairn_pair_view *v);
 /* Binds a pairing code to every current and future peer, so two devices only
  * complete a handshake when they used the same digits. NULL clears it. */
 int cairn_engine_set_code(cairn_engine *n, const char *code);

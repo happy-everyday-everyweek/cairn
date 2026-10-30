@@ -132,7 +132,7 @@ int cairn_engine_beacon(const cairn_engine *n, uint8_t *out, size_t outcap, size
 int cairn_engine_on_beacon(cairn_engine *n, const void *buf, size_t len, uint32_t now_ms)
 {
     cairn_beacon b;
-    int rc;
+    int rc, idx;
 
     if (n == NULL || !n->started) return CAIRN_ERR_STATE;
 
@@ -141,6 +141,20 @@ int cairn_engine_on_beacon(cairn_engine *n, const void *buf, size_t len, uint32_
 
     /* Our own beacon can come back through a multicast loop; ignore it. */
     if (memcmp(b.id, n->beacon.id, CAIRN_ID_BYTES) == 0) return CAIRN_OK;
+
+    /* Recording the neighbour is what makes a device discoverable, but a neighbour is not
+     * yet a peer: the beacon carries only an id and a fingerprint prefix, not the public
+     * key a handshake needs. A slot is created in KNOWN so the caller can see that
+     * someone is out there and answer with its key. The slot gains a usable key only
+     * when a KEY frame arrives, and cairn_engine_connect refuses until then, which is
+     * what stops a handshake being attempted against a zero key.
+     */
+    idx = peer_slot(n, b.id);
+    if (idx >= 0 && n->peers[idx].state == CAIRN_ENGINE_EMPTY) {
+        n->peers[idx].state = CAIRN_ENGINE_KNOWN;
+        if (n->code[0] != '\0')
+            strncpy(n->peers[idx].code, n->code, sizeof n->peers[idx].code - 1);
+    }
 
     return cairn_neighbours_add(&n->neighbours, &b, now_ms);
 }
@@ -161,6 +175,7 @@ int cairn_engine_add_peer(cairn_engine *n, const cairn_pubkey *key, const char *
         return CAIRN_ERR_STATE;
 
     n->peers[idx].key = *key;
+    n->peers[idx].has_key = 1;
     n->peers[idx].state = CAIRN_ENGINE_KNOWN;
     n->peers[idx].confirmed = 0;
     n->peers[idx].initiated = 0;
@@ -186,6 +201,9 @@ int cairn_engine_connect(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
 
     idx = peer_index(n, peer_id);
     if (idx < 0 || n->peers[idx].state != CAIRN_ENGINE_KNOWN) return CAIRN_ERR_STATE;
+    /* A slot seen only in a beacon has no public key; a handshake against zeroes would
+     * fail deep inside X25519 instead of here. */
+    if (!n->peers[idx].has_key) return CAIRN_ERR_STATE;
 
     rc = cairn_session_init(&n->peers[idx].session, &n->identity, &n->peers[idx].key,
                             hello + CAIRN_PUBKEY_BYTES);
@@ -235,6 +253,36 @@ int cairn_engine_set_code(cairn_engine *n, const char *code)
         if (code != NULL) strncpy(n->peers[i].code, code, sizeof n->peers[i].code - 1);
     }
     return CAIRN_OK;
+}
+
+/* ---------------------------------------------------------- pairing decisions */
+
+/* The whole pairing decision, in one place and with no side effects.
+ *
+ * Three rules, in order:
+ *
+ *   without the peer's key there is only one useful thing to send: ours. This must
+ *   come first, because requiring their key before sending ours deadlocks two
+ *   devices that each wait for the other.
+ *   with both keys held, only one side should send HELLO, and we_initiate says
+ *   which. Both sides compute it from the same two device ids, so they never both
+ *   send one.
+ *   a peer already handshaking or finished is left alone; retransmission of those
+ *   phases is the caller's business, not this function's.
+ */
+cairn_pair_action cairn_pair_next(const cairn_pair_view *v)
+{
+    if (v == NULL) return CAIRN_PAIR_IDLE;
+
+    if (v->peer_state == CAIRN_ENGINE_EMPTY || v->peer_state == CAIRN_ENGINE_READY)
+        return CAIRN_PAIR_IDLE;
+
+    if (!v->has_key) return v->key_due ? CAIRN_PAIR_SEND_KEY : CAIRN_PAIR_IDLE;
+
+    if (v->peer_state == CAIRN_ENGINE_KNOWN && v->we_initiate && v->hello_due)
+        return CAIRN_PAIR_SEND_HELLO;
+
+    return CAIRN_PAIR_IDLE;
 }
 
 /* Builds the label a confirmation tag is keyed with.

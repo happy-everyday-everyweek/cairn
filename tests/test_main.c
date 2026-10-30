@@ -48,6 +48,9 @@ void ct_reg_ble(void);
 void ct_reg_discovery(void);
 void ct_reg_bundle(void);
 void ct_reg_pair(void);
+void ct_reg_facade(void);
+void ct_reg_pair_live(void);
+void ct_reg_pair_logic(void);
 
 int main(void)
 {
@@ -71,6 +74,9 @@ int main(void)
     ct_reg_nat();
     ct_reg_bundle();
     ct_reg_pair();
+    ct_reg_facade();
+    ct_reg_pair_live();
+    ct_reg_pair_logic();
     fprintf(stderr, "%d cases\n", g_count);
 
     for (i = 0; i < g_count; i++) {

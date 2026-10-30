@@ -64,6 +64,8 @@ if(CAIRN_BUILD_TESTS)
     file(GLOB CAIRN_TEST_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.c)
     add_executable(cairn_tests ${CAIRN_TEST_SRC})
     target_link_libraries(cairn_tests PRIVATE cairn)
+    find_package(Threads REQUIRED)
+    target_link_libraries(cairn_tests PRIVATE Threads::Threads)
     target_include_directories(cairn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
     enable_testing()
