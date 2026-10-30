@@ -1,4 +1,4 @@
-/* cairn: node orchestration.
+/* cairn: node orchestration (lower layer).
  *
  * A node is the whole library assembled: an identity, a discovery beacon, a
  * neighbour table, a session per peer and a transfer per file. It is deliberately
@@ -12,19 +12,19 @@
  * public key arrives either by the caller registering it (a paired device from
  * storage) or inside the peer's HELLO frame. So the flow is:
  *
- *   cairn_node_init(&node, &identity, "name", port);
- *   cairn_node_beacon(&node, buf, &len);              publish this
- *   cairn_node_on_beacon(&node, buf, len, now);       learn peers
- *   cairn_node_add_peer(&node, &peer_key, "name");    register a paired peer
- *   cairn_node_connect(&node, peer_id, now, &out);    begin a handshake
- *   cairn_node_on_frame(&node, frame, now, &out);     feed every inbound frame
- *   cairn_node_send(&node, peer_id, data, len, &out); queue a message
+ *   cairn_engine_init(&node, &identity, "name", port);
+ *   cairn_engine_beacon(&node, buf, &len);              publish this
+ *   cairn_engine_on_beacon(&node, buf, len, now);       learn peers
+ *   cairn_engine_add_peer(&node, &peer_key, "name");    register a paired peer
+ *   cairn_engine_connect(&node, peer_id, now, &out);    begin a handshake
+ *   cairn_engine_on_frame(&node, frame, now, &out);     feed every inbound frame
+ *   cairn_engine_send(&node, peer_id, data, len, &out); queue a message
  *
  * The node test runs exactly this sequence over an in-memory loopback, which is
  * the same code path a Bluetooth or Wi-Fi Direct link uses.
  */
-#ifndef CAIRN_NODE_H
-#define CAIRN_NODE_H
+#ifndef CAIRN_PROTOCOL_H
+#define CAIRN_PROTOCOL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -55,15 +55,15 @@ extern "C" {
 #define CAIRN_ACCEPT_BYTES (CAIRN_HANDSHAKE_RESP_BYTES + CAIRN_TAG_BYTES)
 
 typedef enum {
-    CAIRN_PEER_EMPTY = 0,
-    CAIRN_PEER_KNOWN = 1,       /* key learned, no handshake yet */
-    CAIRN_PEER_HANDSHAKING = 2,
-    CAIRN_PEER_READY = 3,
-    CAIRN_PEER_FAILED = 4
-} cairn_peer_state;
+    CAIRN_ENGINE_EMPTY = 0,
+    CAIRN_ENGINE_KNOWN = 1,       /* key learned, no handshake yet */
+    CAIRN_ENGINE_HANDSHAKING = 2,
+    CAIRN_ENGINE_READY = 3,
+    CAIRN_ENGINE_FAILED = 4
+} cairn_engine_peer_state_t;
 
 typedef struct {
-    cairn_peer_state state;
+    cairn_engine_peer_state_t state;
     uint8_t id[CAIRN_ID_BYTES];
     cairn_pubkey key;
     char name[CAIRN_NAME_MAX + 1];
@@ -77,16 +77,30 @@ typedef struct {
      * into the application, so it exposes the last delivered message instead. */
     uint8_t last_plain[CAIRN_NODE_MAX_PAYLOAD];
     size_t last_plain_len;
-} cairn_peer;
+    /* Decrypted bytes of the most recent inbound chunk. */
+    uint8_t chunk_plain[CAIRN_CHUNK_BYTES];
+    size_t chunk_plain_len;
+    uint32_t chunk_index;
+    /* The pairing code bound into the handshake, as digits. Zero means none, in
+     * which case the labels fall back to their bare form. */
+    char code[13];
+    int notified;
+} cairn_engine_peer;
 
 typedef struct {
     cairn_identity identity;
     cairn_beacon beacon;
     cairn_neighbours neighbours;
-    cairn_peer peers[CAIRN_NODE_MAX_SESSIONS];
+    cairn_engine_peer peers[CAIRN_NODE_MAX_SESSIONS];
     uint16_t port;
     int started;
-} cairn_node;
+    /* Optional callback for inbound chunks. Without it the bytes stay in the
+     * peer's chunk_plain buffer for the caller to poll. */
+    cairn_chunk_cb sink;
+    void *sink_user;
+    /* Pairing code applied to peers created after this call, empty when none. */
+    char code[13];
+} cairn_engine;
 
 /* One outbound frame. The caller drains this and writes the bytes wherever the
  * transport wants them. */
@@ -94,60 +108,63 @@ typedef struct {
     uint8_t type;
     size_t len;
     uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
-} cairn_outbox;
+} cairn_engine_outbox;
 
-int cairn_node_init(cairn_node *n, const cairn_identity *id, const char *name,
+int cairn_engine_init(cairn_engine *n, const cairn_identity *id, const char *name,
                     uint16_t port);
 
 /* Produces this node's beacon. */
-int cairn_node_beacon(const cairn_node *n, uint8_t *out, size_t outcap, size_t *outlen);
+int cairn_engine_beacon(const cairn_engine *n, uint8_t *out, size_t outcap, size_t *outlen);
 
 /* Records a beacon heard from the network. */
-int cairn_node_on_beacon(cairn_node *n, const void *buf, size_t len, uint32_t now_ms);
+int cairn_engine_on_beacon(cairn_engine *n, const void *buf, size_t len, uint32_t now_ms);
 
 /* Registers a peer's full public key, for a device already paired or reached out
  * of band. Without this, the handshake only starts once the peer says HELLO. */
-int cairn_node_add_peer(cairn_node *n, const cairn_pubkey *key, const char *name);
+int cairn_engine_add_peer(cairn_engine *n, const cairn_pubkey *key, const char *name);
 
 /* Answers a beacon with this node's full public key, so a peer that has only
  * heard our beacon can start a handshake with us. */
-int cairn_node_announce_key(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                            cairn_outbox *out);
+int cairn_engine_announce_key(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                            cairn_engine_outbox *out);
 
 /* Announces this node to a peer, so that peer can run the handshake. Produces a
  * HELLO frame carrying our public key and an init blob. The peer's key must be
  * known. */
-int cairn_node_connect(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                       uint32_t now_ms, cairn_outbox *out);
+int cairn_engine_connect(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                       uint32_t now_ms, cairn_engine_outbox *out);
 
 /* Accepts a HELLO and produces the ACCEPT reply. */
-int cairn_node_accept(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                      uint32_t now_ms, cairn_outbox *out);
+int cairn_engine_accept(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                      uint32_t now_ms, cairn_engine_outbox *out);
 
 /* Feeds one inbound frame. Any reply is placed in out, whose len is 0 when no
  * reply is due. Passing NULL for out is allowed when the reply is not needed. */
-int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
-                        cairn_outbox *out);
+int cairn_engine_on_frame(cairn_engine *n, const cairn_frame *f, uint32_t now_ms,
+                        cairn_engine_outbox *out);
 
 /* Sends a message to a ready peer. A peer that has not confirmed the session is
  * refused, so plaintext never goes out on an unproven channel. */
-int cairn_node_send(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                    const void *data, size_t len, cairn_outbox *out);
+int cairn_engine_send(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                    const void *data, size_t len, cairn_engine_outbox *out);
 
 /* Offers a file to a ready peer, then streams it one chunk per call. */
-int cairn_node_offer_file(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                          uint64_t total_bytes, cairn_outbox *out);
-int cairn_node_pump_transfer(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                             const void *chunk, size_t len, cairn_outbox *out);
+int cairn_engine_offer_file(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                          uint64_t total_bytes, cairn_engine_outbox *out);
+int cairn_engine_pump_transfer(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                             const void *chunk, size_t len, cairn_engine_outbox *out);
 
-int cairn_node_peer_state(const cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES]);
-int cairn_node_peer_count(const cairn_node *n);
-int cairn_node_neighbour_count(const cairn_node *n);
+int cairn_engine_peer_status( const cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES]);
+/* Binds a pairing code to every current and future peer, so two devices only
+ * complete a handshake when they used the same digits. NULL clears it. */
+int cairn_engine_set_code(cairn_engine *n, const char *code);
+int cairn_engine_peer_count(const cairn_engine *n);
+int cairn_engine_neighbour_count(const cairn_engine *n);
 
-void cairn_node_clear(cairn_node *n);
+void cairn_engine_clear(cairn_engine *n);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* CAIRN_NODE_H */
+#endif /* CAIRN_PROTOCOL_H */

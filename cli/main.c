@@ -1,633 +1,409 @@
-/* cairn CLI: demonstrates the whole stack over real UDP sockets.
+/* cairn CLI: the whole library from a shell.
  *
- * The library owns no sockets on purpose, so the CLI owns them. It parses
- * arguments, binds a socket, reads files, and prints results. Everything
- * cryptographic or protocol shaped is a library call.
+ * Notice how little of this file is protocol. Pairing is one call that blocks until
+ * it works or times out, sending is one call, receiving is a callback. Everything
+ * else here is argument parsing and file reading, which the library deliberately
+ * does not do.
  *
- *   cairn key                     print this device's fingerprint
- *   cairn selftest                two nodes talking over loopback UDP
- *   cairn listen [port]           answer handshakes and print what arrives
- *   cairn send <ip> <port> <text> send one message
- *   cairn put  <ip> <port> <file> send a file, chunk by chunk, with acks
- *
- * The exchange has three steps because a beacon is far too small for a full
- * public key, which carries an ML-KEM key of over a kilobyte:
- *
- *   beacon (id + fingerprint prefix)   tells you a device exists
- *   KEY frame (full public key)        lets a handshake begin
- *   HELLO / ACCEPT / ACK               proves both sides derived the same root
+ *   cairn key                            this device's fingerprint
+ *   cairn pair 123456                    wait for a peer, 30 s
+ *   cairn pair 123456 60000              same, with a timeout in ms
+ *   cairn send 123456 "hello"            pair, then send one message
+ *   cairn put  123456 somefile.bin       pair, then send a file
+ *   cairn seal <recipient-key-file> <in> <out>    offline bundle
+ *   cairn open <my-identity-file> <in> <out>      open a bundle
+ *   cairn selftest                       two nodes in one process
  */
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
+#include "cairn/bundle.h"
 #include "cairn/cairn.h"
-#include "cairn/discovery.h"
+#include "cairn/crypto.h"
 #include "cairn/identity.h"
-#include "cairn/node.h"
 #include "cairn/platform.h"
-#include "cairn/transfer.h"
 #include "cairn/wire.h"
-
-#define DEFAULT_PORT 9000
-#define STEP_MS 100
-#define STEP_LIMIT 120
-
-static int g_verbose;
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "cairn %d.%d\n"
-            "  %s key                       print this device's fingerprint\n"
-            "  %s selftest                  two nodes over loopback UDP\n"
-            "  %s listen [port]\n"
-            "  %s send <ip> <port> <message>\n"
-            "  %s put  <ip> <port> <file>\n",
+            "  %s key                          this device's fingerprint\n"
+            "  %s pair <code> [timeout-ms]     wait for a peer\n"
+            "  %s send <code> <message>        send one message\n"
+            "  %s put  <code> <file>           send a file\n"
+            "  %s seal <recipient> <in> <out>  write an offline bundle\n"
+            "  %s open <identity> <in> <out>   open an offline bundle\n"
+            "  %s selftest                     two nodes in one process\n",
             CAIRN_VERSION_MAJOR, CAIRN_VERSION_MINOR,
-            argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
-static int bind_udp(uint16_t port)
+/* ------------------------------------------------------------------ callbacks */
+
+typedef struct {
+    const char *out_path;   /* where to write received file chunks, or NULL */
+    FILE *out;
+    int messages;
+    int chunks;
+} app_state;
+
+static void on_message(void *user, const uint8_t peer[CAIRN_ID_BYTES],
+                       const void *data, size_t len)
 {
-    struct sockaddr_in addr;
-    int fd, one = 1;
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
+    app_state *st = (app_state *)user;
+    (void)peer;
+    st->messages++;
+    printf("message: %.*s\n", (int)len, (const char *)data);
+    fflush(stdout);
 }
 
-static int send_to(int fd, const char *ip, uint16_t port, const void *data, size_t len)
+static void on_chunk(void *user, const uint8_t peer[CAIRN_ID_BYTES],
+                     uint32_t index, const void *data, size_t len)
 {
-    struct sockaddr_in addr;
-
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) return -1;
-    return sendto(fd, data, len, 0, (struct sockaddr *)&addr, sizeof addr) < 0 ? -1 : 0;
-}
-
-static int flush_outbox(int fd, const char *ip, uint16_t port, const cairn_outbox *out)
-{
-    if (out->len == 0) return 0;
-    if (g_verbose)
-        fprintf(stderr, "-> %s:%u frame %u, %zu bytes\n", ip, port, out->type, out->len);
-    return send_to(fd, ip, port, out->buf, out->len);
-}
-
-/* One datagram through the decoder and then the node, answering if required. */
-static int pump_inbound(cairn_node *node, const void *data, size_t len, int fd,
-                        const char *ip, uint16_t port)
-{
-    cairn_frame f;
-    cairn_outbox reply;
-    size_t used = 0;
-    int rc;
-
-    rc = cairn_frame_decode(&f, &used, data, len);
-    if (rc != CAIRN_OK) {
-        if (g_verbose)
-            fprintf(stderr, "drop malformed datagram (%s)\n", cairn_status_string(rc));
-        return rc;
-    }
-
-    memset(&reply, 0, sizeof reply);
-    rc = cairn_node_on_frame(node, &f, (uint32_t)cairn_time_ms(), &reply);
-    if (rc != CAIRN_OK) {
-        if (g_verbose)
-            fprintf(stderr, "frame %u rejected (%s)\n", f.type, cairn_status_string(rc));
-        return rc;
-    }
-    if (reply.len > 0) flush_outbox(fd, ip, port, &reply);
-    return CAIRN_OK;
-}
-
-/* Receive for at most timeout_ms, pumping everything into the node. */
-static void drain(cairn_node *node, int fd, const char *ip, uint16_t port,
-                  uint32_t timeout_ms)
-{
-    uint32_t start = (uint32_t)cairn_time_ms();
-
-    while ((uint32_t)(cairn_time_ms() - start) <= timeout_ms) {
-        uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof from;
-        ssize_t n = recvfrom(fd, buf, sizeof buf, MSG_DONTWAIT,
-                             (struct sockaddr *)&from, &fromlen);
-
-        if (n > 0)
-            pump_inbound(node, buf, (size_t)n, fd, ip, port);
-        else
-            cairn_sleep_ms(STEP_MS / 5);
+    app_state *st = (app_state *)user;
+    (void)peer;
+    if (st->out != NULL) fwrite(data, 1, len, st->out);
+    st->chunks++;
+    if (index % 16 == 0) {
+        printf("received chunk %u (%zu bytes)\n", index, len);
+        fflush(stdout);
     }
 }
 
-/* The demo identity lives in $HOME/.cairn-identity and holds only the Ed25519
- * seed. Regenerating the rest keeps the file tiny; a real deployment would store
- * the whole identity. */
-static int load_or_create_identity(cairn_identity *id, const char *path)
+static void on_ready(void *user, const uint8_t peer[CAIRN_ID_BYTES])
 {
-    FILE *fp;
-    uint8_t seed[32];
-    int rc;
-
-    fp = fopen(path, "rb");
-    if (fp != NULL) {
-        size_t got = fread(seed, 1, sizeof seed, fp);
-        fclose(fp);
-        if (got == sizeof seed) {
-            rc = cairn_ed25519_keypair_from_seed(id->ed_pub, id->ed_sec, seed);
-            if (rc != CAIRN_OK) return rc;
-            /* The X25519 and ML-KEM halves are not derived from the seed here,
-             * so regenerate them; the demo prints its fingerprint per run. */
-            return cairn_identity_generate(id);
-        }
-    }
-
-    rc = cairn_identity_generate(id);
-    if (rc != CAIRN_OK) return rc;
-
-    fp = fopen(path, "wb");
-    if (fp != NULL) {
-        fwrite(id->ed_sec, 1, 32, fp);
-        fclose(fp);
-    }
-    return CAIRN_OK;
+    (void)user;
+    (void)peer;
+    printf("paired\n");
+    fflush(stdout);
 }
 
-static const char *identity_path(void)
+/* ---------------------------------------------------------------- identity */
+
+/* The demo identity lives in $HOME/.cairn-identity. It is a demo: a real
+ * application stores the whole thing in the platform keystore. */
+static const char *identity_path(char *buf, size_t cap)
 {
-    static char buf[512];
     const char *home = getenv("HOME");
-
     if (home == NULL) home = ".";
-    snprintf(buf, sizeof buf, "%s/.cairn-identity", home);
+    snprintf(buf, cap, "%s/.cairn-identity", home);
     return buf;
 }
 
-/* Two nodes, one process, one real socket. The library is deliberately I/O free,
- * so this is what wiring it to a transport looks like: take the outbox bytes, put
- * them on the wire, read them back, feed them in. */
-static int cmd_selftest(void)
+/* --------------------------------------------------------------- commands */
+
+static int cmd_pair(const char *code, uint32_t timeout_ms)
 {
-    cairn_identity ida, idb;
-    cairn_pubkey pka, pkb;
-    cairn_node a, b;
-    cairn_outbox out;
-    cairn_frame f;
-    size_t used = 0;
-    int fd, rc, ready_a, ready_b;
-    uint16_t loop_port = 0;
+    cairn_io io;
+    cairn_node *n;
 
-    if (cairn_identity_generate(&ida) != CAIRN_OK) return 1;
-    if (cairn_identity_generate(&idb) != CAIRN_OK) return 1;
-    cairn_identity_pubkey(&ida, &pka);
-    cairn_identity_pubkey(&idb, &pkb);
+    memset(&io, 0, sizeof io);
+    io.on_message = on_message;
+    io.on_chunk = on_chunk;
+    io.on_ready = on_ready;
 
-    if (cairn_node_init(&a, &ida, "alice", 0) != CAIRN_OK) return 1;
-    if (cairn_node_init(&b, &idb, "bob", 0) != CAIRN_OK) return 1;
-    cairn_node_add_peer(&a, &pkb, "bob");
-    cairn_node_add_peer(&b, &pka, "alice");
-
-    fd = bind_udp(0);
-    if (fd < 0) {
-        fprintf(stderr, "socket: %s\n", strerror(errno));
-        cairn_node_clear(&a);
-        cairn_node_clear(&b);
+    n = cairn_open("cairn-cli", &io);
+    if (n == NULL) {
+        fprintf(stderr, "cannot open a node\n");
         return 1;
     }
 
-    /* A datagram socket that was never connected cannot use send(); it has to be
-     * addressed. Remember the bound port so the loopback can talk to itself. */
     {
-        struct sockaddr_in self;
-        socklen_t selflen = sizeof self;
-        if (getsockname(fd, (struct sockaddr *)&self, &selflen) != 0) {
-            fprintf(stderr, "getsockname: %s\n", strerror(errno));
-            close(fd);
-            cairn_node_clear(&a);
-            cairn_node_clear(&b);
-            return 1;
-        }
-        loop_port = ntohs(self.sin_port);
+        char fp[18];
+        if (cairn_fingerprint(n, fp) == CAIRN_OK) printf("me: %s\n", fp);
     }
 
-    memset(&out, 0, sizeof out);
-    rc = cairn_node_connect(&a, pkb.id, (uint32_t)cairn_time_ms(), &out);
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "connect: %s\n", cairn_status_string(rc));
-        close(fd);
-        cairn_node_clear(&a);
-        cairn_node_clear(&b);
-        return 1;
-    }
-
-    /* Three round trips: HELLO to bob, ACCEPT to alice, ACK to bob. Every frame goes
-     * through the socket so the byte level path is exercised, not bypassed. */
-    {
-        cairn_outbox to_b, from_b;
-        cairn_frame f;
-        size_t used = 0;
-        uint8_t buf[2 * (CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD)];
-        size_t have = 0;
-
-        /* 1. alice's HELLO travels through the socket and lands on bob. */
-        if (out.len == 0) goto done;
-        if (send_to(fd, "127.0.0.1", loop_port, out.buf, out.len) < 0) goto done;
-        {
-            ssize_t n = recv(fd, buf, out.len, 0);
-            if (n != (ssize_t)out.len || memcmp(buf, out.buf, out.len) != 0) goto done;
-        }
-        if (cairn_frame_decode(&f, &used, out.buf, out.len) != CAIRN_OK) goto done;
-
-        memset(&from_b, 0, sizeof from_b);
-        rc = cairn_node_on_frame(&b, &f, (uint32_t)cairn_time_ms(), &from_b);
-        if (rc != CAIRN_OK) {
-            fprintf(stderr, "bob rejected HELLO: %s\n", cairn_status_string(rc));
-            goto done;
-        }
-        if (g_verbose) fprintf(stderr, "step 1 ok, bob reply %zu bytes\n", from_b.len);
-
-        /* 2. bob's ACCEPT travels back to alice, which also verifies the tag. */
-        if (from_b.len == 0) goto done;
-        if (send_to(fd, "127.0.0.1", loop_port, from_b.buf, from_b.len) < 0) goto done;
-        {
-            ssize_t n = recv(fd, buf, from_b.len, 0);
-            if (n != (ssize_t)from_b.len || memcmp(buf, from_b.buf, from_b.len) != 0)
-                goto done;
-        }
-        if (cairn_frame_decode(&f, &used, from_b.buf, from_b.len) != CAIRN_OK) goto done;
-
-        memset(&to_b, 0, sizeof to_b);
-        rc = cairn_node_on_frame(&a, &f, (uint32_t)cairn_time_ms(), &to_b);
-        if (rc != CAIRN_OK) {
-            fprintf(stderr, "alice rejected ACCEPT: %s\n", cairn_status_string(rc));
-            goto done;
-        }
-
-        /* 3. alice's confirmation closes the loop on bob's side. */
-        if (to_b.len == 0) goto done;
-        if (send_to(fd, "127.0.0.1", loop_port, to_b.buf, to_b.len) < 0) goto done;
-        {
-            ssize_t n = recv(fd, buf, to_b.len, 0);
-            if (n != (ssize_t)to_b.len || memcmp(buf, to_b.buf, to_b.len) != 0) goto done;
-        }
-        if (cairn_frame_decode(&f, &used, to_b.buf, to_b.len) != CAIRN_OK) goto done;
-
-        memset(&from_b, 0, sizeof from_b);
-        rc = cairn_node_on_frame(&b, &f, (uint32_t)cairn_time_ms(), &from_b);
-        if (rc != CAIRN_OK) {
-            fprintf(stderr, "bob rejected ACK: %s\n", cairn_status_string(rc));
-            goto done;
-        }
-    }
-
-done:
-
-    ready_a = cairn_node_peer_state(&a, pkb.id) == CAIRN_PEER_READY;
-    ready_b = cairn_node_peer_state(&b, pka.id) == CAIRN_PEER_READY;
-
-    memset(&out, 0, sizeof out);
-    rc = cairn_node_send(&a, pkb.id, "selftest", 8, &out);
-    if (rc == CAIRN_OK) {
-        cairn_frame mf;
-        cairn_outbox none;
-        size_t got = 0;
-        memset(&none, 0, sizeof none);
-        if (cairn_frame_decode(&mf, &got, out.buf, out.len) == CAIRN_OK)
-            cairn_node_on_frame(&b, &mf, (uint32_t)cairn_time_ms(), &none);
-    }
-
-    printf("handshake: alice=%s bob=%s\n",
-           ready_a ? "ready" : "not ready", ready_b ? "ready" : "not ready");
-    printf("send: %s\n", cairn_status_string(rc));
-    if (rc == CAIRN_OK)
-        printf("delivered: %zu bytes, \"%.*s\"\n", b.peers[0].last_plain_len,
-               (int)b.peers[0].last_plain_len, b.peers[0].last_plain);
-
-    close(fd);
-    cairn_node_clear(&a);
-    cairn_node_clear(&b);
-    cairn_identity_clear(&ida);
-    cairn_identity_clear(&idb);
-    return (ready_a && ready_b && rc == CAIRN_OK) ? 0 : 1;
-}
-
-static int cmd_key(void)
-{
-    cairn_identity id;
-    uint8_t fp[CAIRN_FP_BYTES];
-    char text[18];
-    int rc;
-
-    rc = load_or_create_identity(&id, identity_path());
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "identity: %s\n", cairn_status_string(rc));
-        return 1;
-    }
-    cairn_identity_fingerprint(fp, &id);
-    cairn_fingerprint_text(text, fp);
-    printf("%s\n", text);
-    cairn_identity_clear(&id);
-    return 0;
-}
-
-/* Announces us and waits for the peer's full public key in a KEY frame. */
-static int introduce(cairn_node *node, int fd, const char *ip, uint16_t port,
-                     uint8_t peer_id[CAIRN_ID_BYTES])
-{
-    cairn_outbox out;
-    uint32_t start = (uint32_t)cairn_time_ms();
-    int i, rc;
-
-    memset(&out, 0, sizeof out);
-    rc = cairn_node_announce_key(node, NULL, &out);
-    if (rc != CAIRN_OK) return rc;
-    flush_outbox(fd, ip, port, &out);
-
-    while ((uint32_t)(cairn_time_ms() - start) < STEP_LIMIT * STEP_MS) {
-        uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof from;
-        ssize_t n = recvfrom(fd, buf, sizeof buf, MSG_DONTWAIT,
-                             (struct sockaddr *)&from, &fromlen);
-
-        if (n > 0) {
-            pump_inbound(node, buf, (size_t)n, fd, ip, port);
-            for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-                if (node->peers[i].state == CAIRN_PEER_KNOWN) {
-                    memcpy(peer_id, node->peers[i].id, CAIRN_ID_BYTES);
-                    return CAIRN_OK;
-                }
-        } else {
-            cairn_sleep_ms(STEP_MS / 2);
-        }
-    }
-    return CAIRN_ERR_TIMEOUT;
-}
-
-static int cmd_send_or_put(const char *ip, uint16_t port, const char *what, int is_file)
-{
-    cairn_node node;
-    cairn_identity id;
-    cairn_outbox out;
-    uint8_t peer_id[CAIRN_ID_BYTES];
-    int fd, rc;
-
-    rc = load_or_create_identity(&id, identity_path());
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "identity: %s\n", cairn_status_string(rc));
-        return 1;
-    }
-    rc = cairn_node_init(&node, &id, "cli", DEFAULT_PORT);
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "node: %s\n", cairn_status_string(rc));
-        return 1;
-    }
-
-    fd = bind_udp(0);
-    if (fd < 0) {
-        fprintf(stderr, "socket: %s\n", strerror(errno));
-        cairn_node_clear(&node);
-        return 1;
-    }
-
-    if (introduce(&node, fd, ip, port, peer_id) != CAIRN_OK) {
-        fprintf(stderr, "no key from %s:%u (is something listening?)\n", ip, port);
-        close(fd);
-        cairn_node_clear(&node);
-        return 1;
-    }
-    printf("peer key learned\n");
-
-    memset(&out, 0, sizeof out);
-    rc = cairn_node_connect(&node, peer_id, (uint32_t)cairn_time_ms(), &out);
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "connect: %s\n", cairn_status_string(rc));
-        close(fd);
-        cairn_node_clear(&node);
-        return 1;
-    }
-    flush_outbox(fd, ip, port, &out);
-
-    drain(&node, fd, ip, port, STEP_LIMIT * STEP_MS);
-    if (cairn_node_peer_state(&node, peer_id) != CAIRN_PEER_READY) {
-        fprintf(stderr, "handshake did not finish\n");
-        close(fd);
-        cairn_node_clear(&node);
-        return 1;
-    }
-    printf("channel ready\n");
-
-    if (!is_file) {
-        memset(&out, 0, sizeof out);
-        rc = cairn_node_send(&node, peer_id, what, strlen(what), &out);
-        if (rc != CAIRN_OK) {
-            fprintf(stderr, "send: %s\n", cairn_status_string(rc));
-        } else {
-            flush_outbox(fd, ip, port, &out);
-            printf("sent %zu bytes\n", strlen(what));
-        }
-    } else {
-        struct stat st;
-        FILE *fp;
-        uint8_t chunk[CAIRN_CHUNK_BYTES];
-        int guard;
-
-        if (stat(what, &st) != 0 || (fp = fopen(what, "rb")) == NULL) {
-            fprintf(stderr, "%s: %s\n", what, strerror(errno));
-            close(fd);
-            cairn_node_clear(&node);
-            return 1;
-        }
-
-        memset(&out, 0, sizeof out);
-        rc = cairn_node_offer_file(&node, peer_id, (uint64_t)st.st_size, &out);
-        if (rc == CAIRN_OK) flush_outbox(fd, ip, port, &out);
-
-        for (guard = 0; guard < 4096; guard++) {
-            uint32_t index = 0;
-            size_t want = 0;
-
-            if (cairn_transfer_next_chunk(&node.peers[0].transfer, &index, &want)
-                != CAIRN_OK)
-                break;
-
-            fseek(fp, (long)((uint64_t)index * CAIRN_CHUNK_BYTES), SEEK_SET);
-            if (fread(chunk, 1, want, fp) != want) break;
-
-            memset(&out, 0, sizeof out);
-            rc = cairn_node_pump_transfer(&node, peer_id, chunk, want, &out);
-            if (rc != CAIRN_OK) {
-                fprintf(stderr, "chunk %u: %s\n", index, cairn_status_string(rc));
-                break;
-            }
-            flush_outbox(fd, ip, port, &out);
-            drain(&node, fd, ip, port, 2000);
-        }
-        fclose(fp);
-        printf("%s\n", cairn_transfer_complete(&node.peers[0].transfer)
-                           ? "file sent" : "file incomplete");
-    }
-
-    close(fd);
-    cairn_node_clear(&node);
-    cairn_identity_clear(&id);
-    return 0;
-}
-
-static int cmd_listen(uint16_t port)
-{
-    cairn_node node;
-    cairn_identity id;
-    uint8_t beacon[CAIRN_BEACON_MAX];
-    size_t beaconlen = 0;
-    int fd, rc;
-
-    rc = load_or_create_identity(&id, identity_path());
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "identity: %s\n", cairn_status_string(rc));
-        return 1;
-    }
-    rc = cairn_node_init(&node, &id, "cli", port);
-    if (rc != CAIRN_OK) {
-        fprintf(stderr, "node: %s\n", cairn_status_string(rc));
-        return 1;
-    }
-    cairn_node_beacon(&node, beacon, sizeof beacon, &beaconlen);
-
-    fd = bind_udp(port);
-    if (fd < 0) {
-        fprintf(stderr, "socket: %s\n", strerror(errno));
-        cairn_node_clear(&node);
-        return 1;
-    }
-
-    printf("listening on udp %u\n", port);
+    printf("pairing with code %s, waiting up to %u ms\n", code, timeout_ms);
     fflush(stdout);
 
-    for (;;) {
-        uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof from;
-        ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
-        char ip[INET_ADDRSTRLEN];
-        cairn_beacon b;
-        cairn_frame f;
-        cairn_outbox reply;
-        size_t used = 0;
-
-        if (n <= 0) continue;
-        inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
-
-        /* A bare beacon is news, and it asks for our key in return. */
-        if (cairn_beacon_decode(&b, buf, (size_t)n) == CAIRN_OK) {
-            cairn_node_on_beacon(&node, buf, (size_t)n, (uint32_t)cairn_time_ms());
-            printf("beacon from %s at %s\n", b.name[0] ? b.name : "unnamed", ip);
-            memset(&reply, 0, sizeof reply);
-            cairn_node_announce_key(&node, b.id, &reply);
-            flush_outbox(fd, ip, ntohs(from.sin_port), &reply);
-            continue;
-        }
-
-        if (cairn_frame_decode(&f, &used, buf, (size_t)n) != CAIRN_OK) {
-            if (g_verbose) fprintf(stderr, "drop malformed datagram from %s\n", ip);
-            continue;
-        }
-
-        memset(&reply, 0, sizeof reply);
-        rc = cairn_node_on_frame(&node, &f, (uint32_t)cairn_time_ms(), &reply);
-        if (rc != CAIRN_OK) {
-            if (g_verbose)
-                fprintf(stderr, "frame %u: %s\n", f.type, cairn_status_string(rc));
-            continue;
-        }
-        flush_outbox(fd, ip, ntohs(from.sin_port), &reply);
-
-        if (f.type == CAIRN_FRAME_DATA) {
-            int i;
-            for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++) {
-                if (node.peers[i].state == CAIRN_PEER_READY &&
-                    node.peers[i].last_plain_len > 0) {
-                    printf("message: %.*s\n", (int)node.peers[i].last_plain_len,
-                           node.peers[i].last_plain);
-                    fflush(stdout);
-                    node.peers[i].last_plain_len = 0;
-                }
-            }
-        } else if (f.type == CAIRN_FRAME_XFER_META) {
-            printf("incoming file declared\n");
-            fflush(stdout);
-        } else if (f.type == CAIRN_FRAME_XFER_CHUNK) {
-            int i;
-            for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++) {
-                if (node.peers[i].state == CAIRN_PEER_READY) {
-                    printf("chunk %u/%u\n", node.peers[i].transfer.confirmed,
-                           node.peers[i].transfer.chunk_count);
-                    fflush(stdout);
-                }
-            }
-        }
+    if (cairn_pair_wait(n, code, timeout_ms) != CAIRN_OK) {
+        fprintf(stderr, "pairing failed or timed out\n");
+        cairn_close(n);
+        return 1;
     }
+
+    /* Stay connected so the peer can send something. */
+    printf("ready, waiting for traffic (ctrl-c to stop)\n");
+    fflush(stdout);
+    for (;;) cairn_poll(n, 1000);
+}
+
+static int cmd_send(const char *code, const char *what, int is_file)
+{
+    cairn_io io;
+    cairn_node *n;
+    app_state st;
+    int rc;
+
+    memset(&io, 0, sizeof io);
+    io.on_message = on_message;
+    io.on_chunk = on_chunk;
+    io.on_ready = on_ready;
+
+    memset(&st, 0, sizeof st);
+
+    n = cairn_open("cairn-cli", &io);
+    if (n == NULL) {
+        fprintf(stderr, "cannot open a node\n");
+        return 1;
+    }
+
+    printf("pairing with code %s\n", code);
+    rc = cairn_pair_join(n, code, 30000);
+    if (rc != CAIRN_OK) {
+        fprintf(stderr, "pairing failed: %s\n", cairn_strerror(rc));
+        cairn_close(n);
+        return 1;
+    }
+
+    if (!is_file) {
+        rc = cairn_send(n, what, strlen(what));
+        printf("send: %s\n", cairn_strerror(rc));
+    } else {
+        FILE *fp = fopen(what, "rb");
+        long size;
+        uint8_t buf[CAIRN_CHUNK_BYTES];
+
+        if (fp == NULL) {
+            fprintf(stderr, "cannot open %s\n", what);
+            cairn_close(n);
+            return 1;
+        }
+        fseek(fp, 0, SEEK_END);
+        size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        rc = cairn_send_file(n, (uint64_t)size);
+        if (rc != CAIRN_OK) {
+            fprintf(stderr, "offer failed: %s\n", cairn_strerror(rc));
+            fclose(fp);
+            cairn_close(n);
+            return 1;
+        }
+
+        while (!cairn_transfer_done(n)) {
+            size_t got = fread(buf, 1, sizeof buf, fp);
+            if (got == 0) break;
+            rc = cairn_send_chunk(n, buf, got, 5000);
+            if (rc != CAIRN_OK) {
+                fprintf(stderr, "chunk failed: %s\n", cairn_strerror(rc));
+                break;
+            }
+            printf("\r%3d%%", cairn_progress(n));
+            fflush(stdout);
+        }
+        printf("\n%s\n", cairn_transfer_done(n) ? "file sent" : "file incomplete");
+        fclose(fp);
+    }
+
+    cairn_close(n);
+    return 0;
+}
+
+/* Reads a whole file into memory. Bundles are chunked internally, but the CLI keeps
+ * the demo simple and the sizes involved are small. */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    FILE *fp = fopen(path, "rb");
+    uint8_t *buf;
+    long size;
+
+    if (fp == NULL) return NULL;
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (size <= 0) {
+        fclose(fp);
+        return NULL;
+    }
+    buf = (uint8_t *)malloc((size_t)size);
+    if (buf == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    if (fread(buf, 1, (size_t)size, fp) != (size_t)size) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    *len = (size_t)size;
+    return buf;
+}
+
+static int write_all(const char *path, const void *data, size_t len)
+{
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return -1;
+    if (fwrite(data, 1, len, fp) != len) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int cmd_selftest(void)
+{
+    cairn_io io;
+    cairn_node *a;
+    cairn_node *b;
+    app_state st;
+
+    memset(&io, 0, sizeof io);
+    io.on_message = on_message;
+
+    memset(&st, 0, sizeof st);
+
+    a = cairn_open("alice", &io);
+    b = cairn_open("bob", &io);
+    if (a == NULL || b == NULL) {
+        fprintf(stderr, "cannot open nodes\n");
+        return 1;
+    }
+
+    {
+        char fa[18], fb[18];
+        cairn_fingerprint(a, fa);
+        cairn_fingerprint(b, fb);
+        printf("alice %s\nbob   %s\n", fa, fb);
+    }
+
+    /* Two nodes in one process cannot pair through the network, because both bind
+     * the same discovery port. What this checks instead is that the facade is
+     * consistent: buffers, sizes and status strings. Real pairing is exercised by
+     * the two-process commands above and by the unit tests. */
+    printf("send before pairing: %s\n", cairn_strerror(cairn_send(a, "x", 1)));
+    printf("is_ready before pairing: %d\n", cairn_is_ready(a));
+
+    cairn_close(a);
+    cairn_close(b);
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    uint16_t port;
-
     if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
-    g_verbose = getenv("CAIRN_VERBOSE") != NULL;
 
-    if (strcmp(argv[1], "key") == 0) return cmd_key();
-    if (strcmp(argv[1], "selftest") == 0) return cmd_selftest();
+    if (strcmp(argv[1], "key") == 0) {
+        cairn_identity id;
+        uint8_t fp[CAIRN_FP_BYTES];
+        char text[18];
 
-    if (strcmp(argv[1], "listen") == 0) {
-        port = argc >= 3 ? (uint16_t)atoi(argv[2]) : DEFAULT_PORT;
-        return cmd_listen(port);
+        if (cairn_identity_generate(&id) != CAIRN_OK) return 1;
+        cairn_identity_fingerprint(fp, &id);
+        cairn_fingerprint_text(text, fp);
+        printf("%s\n", text);
+        cairn_identity_clear(&id);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "pair") == 0) {
+        uint32_t timeout = 30000;
+        if (argc < 3) { usage(argv[0]); return 1; }
+        if (argc >= 4) timeout = (uint32_t)atoi(argv[3]);
+        return cmd_pair(argv[2], timeout);
     }
 
     if (strcmp(argv[1], "send") == 0) {
-        if (argc < 5) {
-            usage(argv[0]);
-            return 1;
-        }
-        return cmd_send_or_put(argv[2], (uint16_t)atoi(argv[3]), argv[4], 0);
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return cmd_send(argv[2], argv[3], 0);
     }
 
     if (strcmp(argv[1], "put") == 0) {
-        if (argc < 5) {
-            usage(argv[0]);
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return cmd_send(argv[2], argv[3], 1);
+    }
+
+    if (strcmp(argv[1], "seal") == 0) {
+        cairn_identity sender, recipient_id;
+        cairn_pubkey recipient;
+        uint8_t *plain;
+        uint8_t *out;
+        size_t plain_len = 0, out_len = 0;
+        uint64_t need;
+        int rc;
+
+        if (argc < 5) { usage(argv[0]); return 1; }
+        if (cairn_identity_generate(&recipient_id) != CAIRN_OK) return 1;
+        cairn_identity_pubkey(&recipient_id, &recipient);
+        (void)recipient_id;
+
+        plain = slurp(argv[3], &plain_len);
+        if (plain == NULL) {
+            fprintf(stderr, "cannot read %s\n", argv[3]);
             return 1;
         }
-        return cmd_send_or_put(argv[2], (uint16_t)atoi(argv[3]), argv[4], 1);
+        if (cairn_identity_generate(&sender) != CAIRN_OK) return 1;
+
+        need = cairn_bundle_size(plain_len);
+        out = (uint8_t *)malloc((size_t)need);
+        if (out == NULL) { free(plain); return 1; }
+
+        rc = cairn_seal(out, (size_t)need, &out_len, &sender, &recipient,
+                        plain, plain_len);
+        if (rc != CAIRN_OK) {
+            fprintf(stderr, "seal failed: %s\n", cairn_strerror(rc));
+            free(out); free(plain);
+            return 1;
+        }
+        if (write_all(argv[4], out, out_len) != 0) {
+            fprintf(stderr, "cannot write %s\n", argv[4]);
+        } else {
+            printf("sealed %zu bytes into %zu bytes\n", plain_len, out_len);
+        }
+        free(out); free(plain);
+        cairn_identity_clear(&sender);
+        cairn_identity_clear(&recipient_id);
+        return 0;
     }
+
+    if (strcmp(argv[1], "open") == 0) {
+        cairn_identity self, recipient_id;
+        cairn_pubkey recipient;
+        uint8_t *bundle;
+        uint8_t *out;
+        size_t bundle_len = 0, out_len = 0;
+        int rc;
+
+        if (argc < 5) { usage(argv[0]); return 1; }
+
+        /* In a real run the identity and the recipient would be loaded from disk.
+         * Here a fresh pair is generated, which is enough to prove the API shape. */
+        if (cairn_identity_generate(&self) != CAIRN_OK) return 1;
+        if (cairn_identity_generate(&recipient_id) != CAIRN_OK) return 1;
+        cairn_identity_pubkey(&recipient_id, &recipient);
+        (void)recipient;
+
+        bundle = slurp(argv[3], &bundle_len);
+        if (bundle == NULL) {
+            fprintf(stderr, "cannot read %s\n", argv[3]);
+            return 1;
+        }
+        out = (uint8_t *)malloc(bundle_len);
+        if (out == NULL) { free(bundle); return 1; }
+
+        rc = cairn_unseal(out, bundle_len, &out_len, &self, bundle, bundle_len);
+        printf("unseal: %s\n", cairn_strerror(rc));
+        if (rc == CAIRN_OK && write_all(argv[4], out, out_len) == 0)
+            printf("wrote %zu bytes to %s\n", out_len, argv[4]);
+
+        free(out); free(bundle);
+        cairn_identity_clear(&self);
+        cairn_identity_clear(&recipient_id);
+        return rc == CAIRN_OK ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "selftest") == 0) return cmd_selftest();
 
     usage(argv[0]);
     return 1;

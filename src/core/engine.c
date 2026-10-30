@@ -17,8 +17,9 @@
  * marks the channel ready, and the initiator proves the same before the responder
  * does.
  */
-#include "cairn/node.h"
+#include "cairn/protocol.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static void put_u32(uint8_t *p, uint32_t v)
@@ -48,7 +49,7 @@ static uint64_t get_u64(const uint8_t *p)
 
 /* Writes one frame into the outbox. A NULL outbox means the caller does not want
  * the reply, which is allowed everywhere. */
-static int emit(cairn_outbox *out, uint8_t type, const void *payload, size_t len)
+static int emit(cairn_engine_outbox *out, uint8_t type, const void *payload, size_t len)
 {
     size_t used = 0;
     int rc;
@@ -62,26 +63,28 @@ static int emit(cairn_outbox *out, uint8_t type, const void *payload, size_t len
     return CAIRN_OK;
 }
 
-static int peer_index(const cairn_node *n, const uint8_t id[CAIRN_ID_BYTES])
+static int peer_index(const cairn_engine *n, const uint8_t id[CAIRN_ID_BYTES])
 {
     int i;
 
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-        if (n->peers[i].state != CAIRN_PEER_EMPTY &&
+        if (n->peers[i].state != CAIRN_ENGINE_EMPTY &&
             memcmp(n->peers[i].id, id, CAIRN_ID_BYTES) == 0)
             return i;
     return -1;
 }
 
-static int peer_alloc(cairn_node *n, const uint8_t id[CAIRN_ID_BYTES])
+static int peer_alloc(cairn_engine *n, const uint8_t id[CAIRN_ID_BYTES])
 {
     int i;
 
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++) {
-        if (n->peers[i].state == CAIRN_PEER_EMPTY) {
+        if (n->peers[i].state == CAIRN_ENGINE_EMPTY) {
             memset(&n->peers[i], 0, sizeof n->peers[i]);
             memcpy(n->peers[i].id, id, CAIRN_ID_BYTES);
-            n->peers[i].state = CAIRN_PEER_KNOWN;
+            if (n->code[0] != '\0')
+                strncpy(n->peers[i].code, n->code, sizeof n->peers[i].code - 1);
+            n->peers[i].state = CAIRN_ENGINE_KNOWN;
             return i;
         }
     }
@@ -90,14 +93,14 @@ static int peer_alloc(cairn_node *n, const uint8_t id[CAIRN_ID_BYTES])
 
 /* Returns the slot for a known peer, creating a bare one when the caller is
  * registering a key it just learned. */
-static int peer_slot(cairn_node *n, const uint8_t id[CAIRN_ID_BYTES])
+static int peer_slot(cairn_engine *n, const uint8_t id[CAIRN_ID_BYTES])
 {
     int idx = peer_index(n, id);
     if (idx >= 0) return idx;
     return peer_alloc(n, id);
 }
 
-int cairn_node_init(cairn_node *n, const cairn_identity *id, const char *name,
+int cairn_engine_init(cairn_engine *n, const cairn_identity *id, const char *name,
                     uint16_t port)
 {
     cairn_pubkey self;
@@ -120,13 +123,13 @@ int cairn_node_init(cairn_node *n, const cairn_identity *id, const char *name,
     return CAIRN_OK;
 }
 
-int cairn_node_beacon(const cairn_node *n, uint8_t *out, size_t outcap, size_t *outlen)
+int cairn_engine_beacon(const cairn_engine *n, uint8_t *out, size_t outcap, size_t *outlen)
 {
     if (n == NULL || !n->started) return CAIRN_ERR_STATE;
     return cairn_beacon_encode(out, outcap, outlen, &n->beacon);
 }
 
-int cairn_node_on_beacon(cairn_node *n, const void *buf, size_t len, uint32_t now_ms)
+int cairn_engine_on_beacon(cairn_engine *n, const void *buf, size_t len, uint32_t now_ms)
 {
     cairn_beacon b;
     int rc;
@@ -142,7 +145,7 @@ int cairn_node_on_beacon(cairn_node *n, const void *buf, size_t len, uint32_t no
     return cairn_neighbours_add(&n->neighbours, &b, now_ms);
 }
 
-int cairn_node_add_peer(cairn_node *n, const cairn_pubkey *key, const char *name)
+int cairn_engine_add_peer(cairn_engine *n, const cairn_pubkey *key, const char *name)
 {
     int idx;
 
@@ -153,12 +156,12 @@ int cairn_node_add_peer(cairn_node *n, const cairn_pubkey *key, const char *name
 
     /* Re-registering a key for a live session would silently change the peer's
      * identity, so refuse once the channel is up. */
-    if (n->peers[idx].state == CAIRN_PEER_READY ||
-        n->peers[idx].state == CAIRN_PEER_HANDSHAKING)
+    if (n->peers[idx].state == CAIRN_ENGINE_READY ||
+        n->peers[idx].state == CAIRN_ENGINE_HANDSHAKING)
         return CAIRN_ERR_STATE;
 
     n->peers[idx].key = *key;
-    n->peers[idx].state = CAIRN_PEER_KNOWN;
+    n->peers[idx].state = CAIRN_ENGINE_KNOWN;
     n->peers[idx].confirmed = 0;
     n->peers[idx].initiated = 0;
     n->peers[idx].last_plain_len = 0;
@@ -171,8 +174,8 @@ int cairn_node_add_peer(cairn_node *n, const cairn_pubkey *key, const char *name
     return CAIRN_OK;
 }
 
-int cairn_node_connect(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                       uint32_t now_ms, cairn_outbox *out)
+int cairn_engine_connect(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                       uint32_t now_ms, cairn_engine_outbox *out)
 {
     uint8_t hello[CAIRN_HELLO_BYTES];
     cairn_pubkey self;
@@ -182,25 +185,25 @@ int cairn_node_connect(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
     if (n == NULL || peer_id == NULL || !n->started) return CAIRN_ERR_ARG;
 
     idx = peer_index(n, peer_id);
-    if (idx < 0 || n->peers[idx].state != CAIRN_PEER_KNOWN) return CAIRN_ERR_STATE;
+    if (idx < 0 || n->peers[idx].state != CAIRN_ENGINE_KNOWN) return CAIRN_ERR_STATE;
 
     rc = cairn_session_init(&n->peers[idx].session, &n->identity, &n->peers[idx].key,
                             hello + CAIRN_PUBKEY_BYTES);
     if (rc != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_PEER_FAILED;
+        n->peers[idx].state = CAIRN_ENGINE_FAILED;
         return rc;
     }
 
     cairn_identity_pubkey(&n->identity, &self);
     cairn_pubkey_encode(hello, &self);
 
-    n->peers[idx].state = CAIRN_PEER_HANDSHAKING;
+    n->peers[idx].state = CAIRN_ENGINE_HANDSHAKING;
     n->peers[idx].initiated = 1;
     return emit(out, CAIRN_FRAME_HELLO, hello, sizeof hello);
 }
 
-int cairn_node_announce_key(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                            cairn_outbox *out)
+int cairn_engine_announce_key(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                              cairn_engine_outbox *out)
 {
     cairn_pubkey self;
     uint8_t wire[CAIRN_PUBKEY_BYTES];
@@ -215,13 +218,54 @@ int cairn_node_announce_key(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES]
     return emit(out, CAIRN_FRAME_KEY, wire, sizeof wire);
 }
 
+int cairn_engine_set_code(cairn_engine *n, const char *code)
+{
+    int i;
+
+    if (n == NULL) return CAIRN_ERR_ARG;
+    if (code != NULL && strlen(code) > 12) return CAIRN_ERR_ARG;
+
+    /* The code applies to every slot, including one created later, so it is
+     * stamped on the engine and copied into a peer when that peer appears. */
+    memset(n->code, 0, sizeof n->code);
+    if (code != NULL) strncpy(n->code, code, sizeof n->code - 1);
+
+    for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++) {
+        memset(n->peers[i].code, 0, sizeof n->peers[i].code);
+        if (code != NULL) strncpy(n->peers[i].code, code, sizeof n->peers[i].code - 1);
+    }
+    return CAIRN_OK;
+}
+
+/* Builds the label a confirmation tag is keyed with.
+ *
+ * The pairing code goes in here, and that is the whole point: the tag is derived
+ * from the root key and this label, so two devices that used different codes
+ * compute different tags and the handshake fails with CAIRN_ERR_AUTH. Nobody who
+ * only observes the traffic can produce a matching tag either, because producing
+ * it needs the root key.
+ *
+ * Without a code the label is the bare phase name, which keeps the engine usable
+ * on its own for a caller that has already authenticated the peer by other means.
+ */
+static void phase_label(char out[32], const cairn_engine_peer *p, const char *phase)
+{
+    if (p->code[0] == '\0') {
+        snprintf(out, 32, "%s", phase);
+        return;
+    }
+    /* A separator keeps "1" + "23" from colliding with "12" + "3". */
+    snprintf(out, 32, "%s|%s", phase, p->code);
+}
+
 /* Applies a HELLO: binds the sender's key and parks the responder side of the
- * handshake. Shared by cairn_node_on_frame and cairn_node_accept. */
-static int handle_hello(cairn_node *n, const uint8_t *payload, size_t len,
-                        cairn_outbox *out)
+ * handshake. Shared by cairn_engine_on_frame and cairn_engine_accept. */
+static int handle_hello(cairn_engine *n, const uint8_t *payload, size_t len,
+                        cairn_engine_outbox *out)
 {
     cairn_pubkey peer_pk;
     uint8_t accept[CAIRN_ACCEPT_BYTES];
+    char label[32];
     int idx, rc;
 
     if (payload == NULL || len != CAIRN_HELLO_BYTES) return CAIRN_ERR_FORMAT;
@@ -234,31 +278,33 @@ static int handle_hello(cairn_node *n, const uint8_t *payload, size_t len,
 
     /* Trust on first use: the key in the HELLO replaces whatever we had, but only
      * while the channel is not established. */
-    if (n->peers[idx].state == CAIRN_PEER_READY) return CAIRN_ERR_STATE;
+    if (n->peers[idx].state == CAIRN_ENGINE_READY) return CAIRN_ERR_STATE;
     n->peers[idx].key = peer_pk;
 
     rc = cairn_session_respond(&n->peers[idx].session, &n->identity, accept,
                                payload + CAIRN_PUBKEY_BYTES,
                                len - CAIRN_PUBKEY_BYTES);
     if (rc != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_PEER_FAILED;
+        n->peers[idx].state = CAIRN_ENGINE_FAILED;
         return rc;
     }
 
+    phase_label(label, &n->peers[idx], "accept");
     rc = cairn_session_confirm_tag(accept + CAIRN_HANDSHAKE_RESP_BYTES,
-                                   &n->peers[idx].session, "accept");
+                                   &n->peers[idx].session, label);
     if (rc != CAIRN_OK) return rc;
 
-    n->peers[idx].state = CAIRN_PEER_HANDSHAKING;
+    n->peers[idx].state = CAIRN_ENGINE_HANDSHAKING;
     n->peers[idx].initiated = 0;
     return emit(out, CAIRN_FRAME_ACCEPT, accept, sizeof accept);
 }
 
-int cairn_node_accept(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                      uint32_t now_ms, cairn_outbox *out)
+int cairn_engine_accept(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                      uint32_t now_ms, cairn_engine_outbox *out)
 {
-    cairn_peer *p;
+    cairn_engine_peer *p;
     uint8_t accept[CAIRN_ACCEPT_BYTES];
+    char label[32];
     int idx, rc;
 
     (void)now_ms;
@@ -267,43 +313,45 @@ int cairn_node_accept(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
     idx = peer_index(n, peer_id);
     if (idx < 0) return CAIRN_ERR_STATE;
     p = &n->peers[idx];
-    if (p->state != CAIRN_PEER_HANDSHAKING || p->initiated) return CAIRN_ERR_STATE;
+    if (p->state != CAIRN_ENGINE_HANDSHAKING || p->initiated) return CAIRN_ERR_STATE;
     if (!p->session.established) return CAIRN_ERR_STATE;
 
     /* Rebuild the reply from the live session: the peer ephemeral already sits in
      * the session, so re-encoding it is enough. */
     memcpy(accept, p->session.send_dh_pub, CAIRN_HANDSHAKE_RESP_BYTES);
+    phase_label(label, p, "accept");
     rc = cairn_session_confirm_tag(accept + CAIRN_HANDSHAKE_RESP_BYTES,
-                                   &p->session, "accept");
+                                   &p->session, label);
     if (rc != CAIRN_OK) return rc;
     return emit(out, CAIRN_FRAME_ACCEPT, accept, sizeof accept);
 }
 
 /* Finds the single peer waiting on an ACCEPT, which is the one we initiated. */
-static int find_initiating_peer(const cairn_node *n)
+static int find_initiating_peer(const cairn_engine *n)
 {
     int i;
 
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-        if (n->peers[i].state == CAIRN_PEER_HANDSHAKING && n->peers[i].initiated)
+        if (n->peers[i].state == CAIRN_ENGINE_HANDSHAKING && n->peers[i].initiated)
             return i;
     return -1;
 }
 
-static int find_responding_peer(const cairn_node *n)
+static int find_responding_peer(const cairn_engine *n)
 {
     int i;
 
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-        if (n->peers[i].state == CAIRN_PEER_HANDSHAKING && !n->peers[i].initiated)
+        if (n->peers[i].state == CAIRN_ENGINE_HANDSHAKING && !n->peers[i].initiated)
             return i;
     return -1;
 }
 
-static int handle_accept(cairn_node *n, const uint8_t *payload, size_t len,
-                         cairn_outbox *out)
+static int handle_accept(cairn_engine *n, const uint8_t *payload, size_t len,
+                         cairn_engine_outbox *out)
 {
     uint8_t tag[CAIRN_TAG_BYTES];
+    char label[32];
     int idx, rc;
 
     if (payload == NULL || len != CAIRN_ACCEPT_BYTES) return CAIRN_ERR_FORMAT;
@@ -314,27 +362,31 @@ static int handle_accept(cairn_node *n, const uint8_t *payload, size_t len,
     rc = cairn_session_finish(&n->peers[idx].session, payload,
                               CAIRN_HANDSHAKE_RESP_BYTES);
     if (rc != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_PEER_FAILED;
+        n->peers[idx].state = CAIRN_ENGINE_FAILED;
         return rc;
     }
 
-    /* Only trust the channel once the responder has proved it holds our root. */
-    if (cairn_session_check_tag(&n->peers[idx].session, "accept",
+    /* Only trust the channel once the responder has proved it holds our root AND
+     * used our code. A different code makes this fail, which is the point. */
+    phase_label(label, &n->peers[idx], "accept");
+    if (cairn_session_check_tag(&n->peers[idx].session, label,
                                payload + CAIRN_HANDSHAKE_RESP_BYTES) != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_PEER_FAILED;
+        n->peers[idx].state = CAIRN_ENGINE_FAILED;
         return CAIRN_ERR_AUTH;
     }
 
-    n->peers[idx].state = CAIRN_PEER_READY;
+    n->peers[idx].state = CAIRN_ENGINE_READY;
     n->peers[idx].confirmed = 1;
 
-    rc = cairn_session_confirm_tag(tag, &n->peers[idx].session, "confirm");
+    phase_label(label, &n->peers[idx], "confirm");
+    rc = cairn_session_confirm_tag(tag, &n->peers[idx].session, label);
     if (rc != CAIRN_OK) return rc;
     return emit(out, CAIRN_FRAME_ACK, tag, sizeof tag);
 }
 
-static int handle_confirm(cairn_node *n, const uint8_t *payload, size_t len)
+static int handle_confirm(cairn_engine *n, const uint8_t *payload, size_t len)
 {
+    char label[32];
     int idx;
 
     if (payload == NULL || len != CAIRN_TAG_BYTES) return CAIRN_ERR_FORMAT;
@@ -342,19 +394,20 @@ static int handle_confirm(cairn_node *n, const uint8_t *payload, size_t len)
     idx = find_responding_peer(n);
     if (idx < 0) return CAIRN_ERR_STATE;
 
-    if (cairn_session_check_tag(&n->peers[idx].session, "confirm", payload)
+    phase_label(label, &n->peers[idx], "confirm");
+    if (cairn_session_check_tag(&n->peers[idx].session, label, payload)
         != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_PEER_FAILED;
+        n->peers[idx].state = CAIRN_ENGINE_FAILED;
         return CAIRN_ERR_AUTH;
     }
-    n->peers[idx].state = CAIRN_PEER_READY;
+    n->peers[idx].state = CAIRN_ENGINE_READY;
     n->peers[idx].confirmed = 1;
     return CAIRN_OK;
 }
 
 /* Data frames carry the ratchet header in the clear and the ciphertext after it.
  * Any ready peer is tried; the AEAD tag decides which one matches. */
-static int handle_data(cairn_node *n, const uint8_t *payload, size_t len)
+static int handle_data(cairn_engine *n, const uint8_t *payload, size_t len)
 {
     cairn_header hdr;
     int i;
@@ -371,7 +424,7 @@ static int handle_data(cairn_node *n, const uint8_t *payload, size_t len)
         size_t ptlen = 0;
         int rc;
 
-        if (n->peers[i].state != CAIRN_PEER_READY || !n->peers[i].confirmed)
+        if (n->peers[i].state != CAIRN_ENGINE_READY || !n->peers[i].confirmed)
             continue;
 
         rc = cairn_session_open(&n->peers[i].session, &hdr,
@@ -389,19 +442,19 @@ static int handle_data(cairn_node *n, const uint8_t *payload, size_t len)
 }
 
 /* Marks the first peer that arrived before the handshake and answers its HELLO
- * lazily, which is what cairn_node_accept exists for. */
-static int first_responding_peer(const cairn_node *n)
+ * lazily, which is what cairn_engine_accept exists for. */
+static int first_responding_peer(const cairn_engine *n)
 {
     int i;
 
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-        if (n->peers[i].state == CAIRN_PEER_HANDSHAKING && !n->peers[i].initiated)
+        if (n->peers[i].state == CAIRN_ENGINE_HANDSHAKING && !n->peers[i].initiated)
             return i;
     return -1;
 }
 
-int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
-                        cairn_outbox *out)
+int cairn_engine_on_frame(cairn_engine *n, const cairn_frame *f, uint32_t now_ms,
+                        cairn_engine_outbox *out)
 {
     (void)now_ms;
     if (n == NULL || f == NULL || !n->started) return CAIRN_ERR_ARG;
@@ -425,7 +478,7 @@ int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
             if (idx < 0) {
                 /* No handshake pending: treat it as a transfer confirmation. */
                 for (idx = 0; idx < CAIRN_NODE_MAX_SESSIONS; idx++)
-                    if (n->peers[idx].state == CAIRN_PEER_READY) break;
+                    if (n->peers[idx].state == CAIRN_ENGINE_READY) break;
                 if (idx == CAIRN_NODE_MAX_SESSIONS) return CAIRN_ERR_STATE;
             }
             return cairn_transfer_ack(&n->peers[idx].transfer, index);
@@ -444,7 +497,7 @@ int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
         total = get_u64(f->payload);
 
         for (idx = 0; idx < CAIRN_NODE_MAX_SESSIONS; idx++)
-            if (n->peers[idx].state == CAIRN_PEER_READY) break;
+            if (n->peers[idx].state == CAIRN_ENGINE_READY) break;
         if (idx == CAIRN_NODE_MAX_SESSIONS) return CAIRN_ERR_NOT_FOUND;
 
         rc = cairn_transfer_offer(&n->peers[idx].transfer, total);
@@ -457,19 +510,44 @@ int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
     }
 
     case CAIRN_FRAME_XFER_CHUNK: {
+        cairn_header hdr;
         uint32_t index, chunk_len;
+        size_t plain_len = 0;
         int idx, rc;
 
-        if (f->payloadlen < 8) return CAIRN_ERR_FORMAT;
-        index = get_u32(f->payload);
-        chunk_len = get_u32(f->payload + 4);
+        /* epoch | index | length | ratchet key | ciphertext */
+        if (f->payloadlen < 12 + CAIRN_X25519_BYTES + CAIRN_TAG_BYTES)
+            return CAIRN_ERR_FORMAT;
+
+        hdr.epoch = get_u32(f->payload);
+        index = get_u32(f->payload + 4);
+        chunk_len = get_u32(f->payload + 8);
+        memcpy(hdr.dh_pub, f->payload + 12, CAIRN_X25519_BYTES);
 
         for (idx = 0; idx < CAIRN_NODE_MAX_SESSIONS; idx++)
-            if (n->peers[idx].state == CAIRN_PEER_READY) break;
+            if (n->peers[idx].state == CAIRN_ENGINE_READY) break;
         if (idx == CAIRN_NODE_MAX_SESSIONS) return CAIRN_ERR_NOT_FOUND;
 
-        rc = cairn_transfer_ack(&n->peers[idx].transfer, index);
+        if (chunk_len > CAIRN_CHUNK_BYTES) return CAIRN_ERR_FORMAT;
+
+        rc = cairn_session_open(&n->peers[idx].session, &hdr,
+                                n->peers[idx].chunk_plain, sizeof n->peers[idx].chunk_plain,
+                                &plain_len,
+                                f->payload + 12 + CAIRN_X25519_BYTES,
+                                f->payloadlen - 12 - CAIRN_X25519_BYTES);
         if (rc != CAIRN_OK) return rc;
+        if (plain_len != chunk_len) return CAIRN_ERR_FORMAT;
+
+        rc = cairn_transfer_ack(&n->peers[idx].transfer, index);
+        if (rc != CAIRN_OK)
+            return CAIRN_ERR_FORMAT;
+
+        /* Hand the bytes to the caller's sink, if it registered one. */
+        if (n->sink != NULL)
+            n->sink(n->sink_user, n->peers[idx].id, n->peers[idx].chunk_index,
+                    n->peers[idx].chunk_plain, plain_len);
+        n->peers[idx].chunk_index = index;
+        n->peers[idx].chunk_plain_len = plain_len;
 
         {
             uint8_t ack[8];
@@ -488,7 +566,7 @@ int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
         if (rc != CAIRN_OK) return rc;
         /* An announced key is a bare credential, so it may only fill a slot that
          * has no live session yet. */
-        return cairn_node_add_peer(n, &pk, NULL);
+        return cairn_engine_add_peer(n, &pk, NULL);
     }
 
     case CAIRN_FRAME_PING:
@@ -501,8 +579,8 @@ int cairn_node_on_frame(cairn_node *n, const cairn_frame *f, uint32_t now_ms,
     }
 }
 
-int cairn_node_send(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                    const void *data, size_t len, cairn_outbox *out)
+int cairn_engine_send(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                    const void *data, size_t len, cairn_engine_outbox *out)
 {
     uint8_t payload[8 + CAIRN_X25519_BYTES + CAIRN_NODE_MAX_PAYLOAD];
     cairn_header hdr;
@@ -515,7 +593,7 @@ int cairn_node_send(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
 
     idx = peer_index(n, peer_id);
     if (idx < 0) return CAIRN_ERR_STATE;
-    if (n->peers[idx].state != CAIRN_PEER_READY || !n->peers[idx].confirmed)
+    if (n->peers[idx].state != CAIRN_ENGINE_READY || !n->peers[idx].confirmed)
         return CAIRN_ERR_STATE;
 
     rc = cairn_session_seal(&n->peers[idx].session, &hdr,
@@ -531,8 +609,8 @@ int cairn_node_send(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
     return emit(out, CAIRN_FRAME_DATA, payload, 8 + CAIRN_X25519_BYTES + ctlen);
 }
 
-int cairn_node_offer_file(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                          uint64_t total_bytes, cairn_outbox *out)
+int cairn_engine_offer_file(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                          uint64_t total_bytes, cairn_engine_outbox *out)
 {
     uint8_t payload[8];
     int idx, rc;
@@ -541,7 +619,7 @@ int cairn_node_offer_file(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
 
     idx = peer_index(n, peer_id);
     if (idx < 0) return CAIRN_ERR_STATE;
-    if (n->peers[idx].state != CAIRN_PEER_READY || !n->peers[idx].confirmed)
+    if (n->peers[idx].state != CAIRN_ENGINE_READY || !n->peers[idx].confirmed)
         return CAIRN_ERR_STATE;
 
     rc = cairn_transfer_offer(&n->peers[idx].transfer, total_bytes);
@@ -553,10 +631,10 @@ int cairn_node_offer_file(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
     return emit(out, CAIRN_FRAME_XFER_META, payload, sizeof payload);
 }
 
-int cairn_node_pump_transfer(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES],
-                             const void *chunk, size_t len, cairn_outbox *out)
+int cairn_engine_pump_transfer(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
+                             const void *chunk, size_t len, cairn_engine_outbox *out)
 {
-    uint8_t payload[8 + CAIRN_CHUNK_BYTES + CAIRN_TAG_BYTES];
+    uint8_t payload[12 + CAIRN_X25519_BYTES + CAIRN_CHUNK_BYTES + CAIRN_TAG_BYTES];
     uint32_t index = 0;
     size_t want = 0;
     cairn_header hdr;
@@ -568,51 +646,56 @@ int cairn_node_pump_transfer(cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES
 
     idx = peer_index(n, peer_id);
     if (idx < 0) return CAIRN_ERR_STATE;
-    if (n->peers[idx].state != CAIRN_PEER_READY) return CAIRN_ERR_STATE;
+    if (n->peers[idx].state != CAIRN_ENGINE_READY) return CAIRN_ERR_STATE;
 
     rc = cairn_transfer_next_chunk(&n->peers[idx].transfer, &index, &want);
     if (rc != CAIRN_OK) return rc;
     if (len < want) return CAIRN_ERR_ARG;
 
-    /* Index and length travel in the clear so the receiver can acknowledge them,
-     * then the bytes are sealed exactly like any other message. */
-    put_u32(payload, index);
-    put_u32(payload + 4, (uint32_t)want);
-
+    /* The chunk is sealed exactly like a message, so the receiver needs the same
+     * ratchet header to derive the key. Index and length travel alongside so the
+     * receiver can acknowledge the right chunk. */
     rc = cairn_session_seal(&n->peers[idx].session, &hdr,
-                            payload + 8, sizeof payload - 8, &ctlen, chunk, want);
+                            payload + 12 + CAIRN_X25519_BYTES,
+                            sizeof payload - 12 - CAIRN_X25519_BYTES, &ctlen, chunk, want);
     if (rc != CAIRN_OK) return rc;
 
-    return emit(out, CAIRN_FRAME_XFER_CHUNK, payload, 8 + ctlen);
+    put_u32(payload, hdr.epoch);
+    put_u32(payload + 4, hdr.index);
+    put_u32(payload + 8, (uint32_t)want);
+    memcpy(payload + 12, hdr.dh_pub, CAIRN_X25519_BYTES);
+
+    return emit(out, CAIRN_FRAME_XFER_CHUNK, payload,
+                12 + CAIRN_X25519_BYTES + ctlen);
 }
 
-int cairn_node_peer_state(const cairn_node *n, const uint8_t peer_id[CAIRN_ID_BYTES])
+int cairn_engine_peer_status(const cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES])
 {
     int idx;
 
     if (n == NULL || peer_id == NULL) return CAIRN_ERR_ARG;
     idx = peer_index(n, peer_id);
-    if (idx < 0) return CAIRN_PEER_EMPTY;
+    if (idx < 0) return CAIRN_ENGINE_EMPTY;
     return n->peers[idx].state;
 }
 
-int cairn_node_peer_count(const cairn_node *n)
+int cairn_engine_peer_count(const cairn_engine *n)
 {
     int i, count = 0;
 
     if (n == NULL) return 0;
     for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
-        if (n->peers[i].state != CAIRN_PEER_EMPTY) count++;
+        if (n->peers[i].state != CAIRN_ENGINE_EMPTY) count++;
     return count;
 }
 
-int cairn_node_neighbour_count(const cairn_node *n)
+int cairn_engine_neighbour_count(const cairn_engine *n)
 {
     if (n == NULL) return 0;
     return n->neighbours.count;
 }
 
-void cairn_node_clear(cairn_node *n)
+void cairn_engine_clear(cairn_engine *n)
 {
     int i;
 

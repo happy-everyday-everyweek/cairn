@@ -1,6 +1,6 @@
 #include "cairn/cairn.h"
 
-const char *cairn_status_string(int status)
+const char *cairn_strerror(int status)
 {
     switch (status) {
     case CAIRN_OK: return "ok";

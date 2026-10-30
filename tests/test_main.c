@@ -46,7 +46,8 @@ void ct_reg_nat(void);
 void ct_reg_p2p(void);
 void ct_reg_ble(void);
 void ct_reg_discovery(void);
-void ct_reg_node(void);
+void ct_reg_bundle(void);
+void ct_reg_pair(void);
 
 int main(void)
 {
@@ -68,7 +69,8 @@ int main(void)
     ct_reg_ble();
     ct_reg_p2p();
     ct_reg_nat();
-    ct_reg_node();
+    ct_reg_bundle();
+    ct_reg_pair();
     fprintf(stderr, "%d cases\n", g_count);
 
     for (i = 0; i < g_count; i++) {

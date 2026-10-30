@@ -411,7 +411,7 @@ JNIEXPORT jstring JNICALL
 Java_org_cairn_demo_CairnNative_nativeStatusString(JNIEnv *env, jclass cls, jint code)
 {
     (void)cls;
-    return (*env)->NewStringUTF(env, cairn_status_string(code));
+    return (*env)->NewStringUTF(env, cairn_strerror(code));
 }
 
 JNIEXPORT jlong JNICALL
