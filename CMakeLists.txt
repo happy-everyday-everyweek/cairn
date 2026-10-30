@@ -62,6 +62,14 @@ endif()
 option(CAIRN_BUILD_TESTS "Build the test binary" ON)
 if(CAIRN_BUILD_TESTS)
     file(GLOB CAIRN_TEST_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.c)
+
+    # The two-node pairing test uses pthreads and real sockets, so it runs on the
+    # POSIX targets only. Windows still builds and runs every other test.
+    if(WIN32)
+        list(REMOVE_ITEM CAIRN_TEST_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pair_live.c)
+    endif()
+
     add_executable(cairn_tests ${CAIRN_TEST_SRC})
     target_link_libraries(cairn_tests PRIVATE cairn)
     find_package(Threads REQUIRED)
@@ -72,13 +80,13 @@ if(CAIRN_BUILD_TESTS)
     add_test(NAME cairn_tests COMMAND cairn_tests)
 endif()
 
-# The CLI is a demonstration, not part of the library, so it is optional: a build
-# for a target without a shell, such as the Android demo, skips it.
+# The CLI is a demonstration, not part of the library, so it is optional. It uses POSIX
+# sockets and file handling directly, which is the point of a demo: it shows what an
+# application owns. Windows skips it rather than pretending a different path exists.
 option(CAIRN_BUILD_CLI "Build the cairn command line demo" ON)
-if(CAIRN_BUILD_CLI)
+if(CAIRN_BUILD_CLI AND NOT WIN32)
     add_executable(cairn_cli ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c)
     target_link_libraries(cairn_cli PRIVATE cairn)
-    if(WIN32)
-        target_link_libraries(cairn_cli PRIVATE ws2_32)
-    endif()
+    find_package(Threads REQUIRED)
+    target_link_libraries(cairn_cli PRIVATE Threads::Threads)
 endif()

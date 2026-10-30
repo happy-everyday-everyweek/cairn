@@ -13,20 +13,32 @@
  * peer's traffic came from. That covers a LAN and means the facade needs no
  * configuration at all.
  */
-#define _DEFAULT_SOURCE
-#define _POSIX_C_SOURCE 200809L
+/* The socket layer is the one place in this file that differs by platform, so it is
+ * isolated here rather than sprinkled through the code. Windows needs WinSock and its
+ * own close; everything POSIX shaped shares the rest. */
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  define cairn_closesocket closesocket
+#  define cairn_last_socket_error() WSAGetLastError()
+#else
+#  define _DEFAULT_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <sys/time.h>
+#  include <unistd.h>
+#  define cairn_closesocket close
+#endif
 
 #include "cairn/cairn.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include "cairn/protocol.h"
 #include "cairn/crypto.h"
@@ -40,6 +52,10 @@
 #define DISCOVERY_PORT 4242
 #define BEACON_MAGIC0 0xCA
 #define BEACON_MAGIC1 0x17
+
+/* Loopback as a literal, because INADDR_LOOPBACK is not visible under the feature
+ * macros used above on every libc. */
+#define CAIRN_LOOPBACK_ADDR 0x7f000001u
 
 /* One poll slice: short enough that a caller's loop stays responsive, long enough
  * not to spin the CPU. */
@@ -127,7 +143,7 @@ static void beacon_broadcast(cairn_node *n)
     if (n->beacon_fd >= 0) {
         dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
         (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
-        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dst.sin_addr.s_addr = htonl(CAIRN_LOOPBACK_ADDR);
         (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
     }
 
@@ -175,8 +191,22 @@ static void deliver_pending(cairn_node *n)
     }
 }
 
-/* Drains both sockets, feeding everything into the engine. A timeout is not an
- * error here: an empty queue just means there was nothing to do this pass. */
+/* Receive timeout, in milliseconds. The units differ by platform: POSIX wants a
+ * struct timeval, Winsock wants a DWORD of milliseconds. */
+static void set_recv_timeout(int fd, uint32_t ms)
+{
+#ifdef _WIN32
+    DWORD value = (DWORD)ms;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&value, sizeof value);
+#else
+    struct timeval tv;
+    tv.tv_sec = (time_t)(ms / 1000u);
+    tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+#endif
+}
+
+/* Reads at most one datagram and feeds it in. A timeout is not an error here. */
 static void pump_once(cairn_node *n)
 {
     uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
@@ -194,7 +224,7 @@ static void pump_once(cairn_node *n)
         int handled = 0;
 
         if (n->beacon_fd >= 0) {
-            got = recvfrom(n->beacon_fd, buf, sizeof buf, MSG_DONTWAIT,
+            got = recvfrom(n->beacon_fd, buf, sizeof buf, 0,
                            (struct sockaddr *)&from, &fromlen);
             if (got > 0) {
                 cairn_beacon b;
@@ -215,7 +245,7 @@ static void pump_once(cairn_node *n)
             }
         }
 
-        got = recvfrom(n->fd, buf, sizeof buf, MSG_DONTWAIT,
+        got = recvfrom(n->fd, buf, sizeof buf, 0,
                        (struct sockaddr *)&from, &fromlen);
         if (got > 0) {
             handled = 1;
@@ -258,7 +288,6 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
 {
     cairn_node *n;
     struct sockaddr_in bind_addr;
-    struct timeval tv;
 
     if (io == NULL) return NULL;
 
@@ -279,6 +308,16 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
     n->fd = -1;
     n->beacon_fd = -1;
 
+#ifdef _WIN32
+    {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            free(n);
+            return NULL;
+        }
+    }
+#endif
+
     /* Two sockets, because beacons and data have different addressing needs.
      *
      *   fd        an ephemeral port. Everything after discovery goes here, addressed
@@ -296,19 +335,17 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
 
     {
         int one = 1;
-        tv.tv_sec = 0;
-        tv.tv_usec = POLL_SLICE_MS * 1000;
 
-        setsockopt(n->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        setsockopt(n->fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
-        setsockopt(n->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(n->fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        setsockopt(n->fd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+        set_recv_timeout(n->fd, POLL_SLICE_MS);
 
 #ifdef SO_REUSEPORT
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&one, sizeof one);
 #endif
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        setsockopt(n->beacon_fd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+        set_recv_timeout(n->beacon_fd, POLL_SLICE_MS);
     }
 
     memset(&bind_addr, 0, sizeof bind_addr);
@@ -323,7 +360,7 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
      */
     bind_addr.sin_port = htons(DISCOVERY_PORT);
     if (bind(n->beacon_fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) {
-        close(n->beacon_fd);
+        cairn_closesocket(n->beacon_fd);
         n->beacon_fd = -1;
     }
 
@@ -341,8 +378,8 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
     return n;
 
 fail:
-    if (n->fd >= 0) close(n->fd);
-    if (n->beacon_fd >= 0) close(n->beacon_fd);
+    if (n->fd >= 0) cairn_closesocket(n->fd);
+    if (n->beacon_fd >= 0) cairn_closesocket(n->beacon_fd);
     cairn_engine_clear(&n->engine);
     cairn_identity_clear(&n->identity);
     free(n);
@@ -352,8 +389,8 @@ fail:
 void cairn_close(cairn_node *n)
 {
     if (n == NULL) return;
-    if (n->fd >= 0) close(n->fd);
-    if (n->beacon_fd >= 0) close(n->beacon_fd);
+    if (n->fd >= 0) cairn_closesocket(n->fd);
+    if (n->beacon_fd >= 0) cairn_closesocket(n->beacon_fd);
     cairn_engine_clear(&n->engine);
     cairn_identity_clear(&n->identity);
     cairn_memzero(n->code, sizeof n->code);
