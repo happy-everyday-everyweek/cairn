@@ -1,8 +1,11 @@
 # Cairn
 
+[![build](https://github.com/happy-everyday-everyweek/cairn/actions/workflows/build.yml/badge.svg)](https://github.com/happy-everyday-everyweek/cairn/actions/workflows/build.yml)
+
 Peer discovery, pairing by a short code, and end-to-end encrypted transfer in C11.
 Android to Android is the main target; Linux, Windows and macOS build from the same
-sources.
+sources. Every push is built and tested on all four by GitHub Actions, and the debug APK
+comes out as a workflow artifact.
 
 Two devices find each other, the user types the same short code on both, and from then
 on anything sent between them is encrypted. Files resume if the link drops. And for the
@@ -11,7 +14,8 @@ offline bundle through a cloud drive instead.
 
 ## The whole API
 
-Twenty-five functions, and eleven of them cover the everyday path.
+Twenty-seven functions across `cairn.h` and `bundle.h`, and eleven of them cover the
+everyday path.
 
 ```c
 #include "cairn/cairn.h"
@@ -111,9 +115,17 @@ A C11 compiler and CMake 3.16. Nothing else: both cryptographic libraries are co
 `vendor/`, so there is no package manager step and no network access during a build.
 
 The tests need no hardware — Bluetooth and Wi-Fi Direct sit behind vtables filled with
-in-memory fakes, and the STUN parser is fed packets built by hand from RFC 5389.
+in-memory fakes, and the STUN parser is fed packets built by hand from RFC 5389. The one
+test that needs a real network path is the two-node pairing case: it opens two sockets on
+the same host. Hosts that will not deliver a datagram from a socket to another socket on
+loopback get a SKIP with the reason, never a pass.
 
-Current state: 117 tests, all passing, zero compiler warnings under `-Wall -Wextra`.
+Current state: 133 tests, all passing, zero compiler warnings under `-Wall -Wextra`, on
+Linux, Windows and macOS.
+
+The Android demo is built by `gradle :app:assembleDebug` in CI, because the repository
+carries no wrapper and the SDK, NDK and CMake all come from the runner. Each run publishes
+`cairn-android-debug` as an artifact, and a `v*` tag also attaches the APK to the release.
 
 ## Command line
 

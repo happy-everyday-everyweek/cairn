@@ -29,15 +29,12 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
-
+      # -V rather than --output-on-failure: the suite prints a pass/fail/skip summary
+      # that is worth seeing on every run, and a case that is skipped for a missing
+      # environment capability should be visible, not silently counted as a pass.
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release -V
 
-      # The two-node pairing test uses real sockets and threads, so it is the closest
-      # thing to an integration test the desktop side has.
-      - name: Pairing over real sockets
-        if: matrix.name == 'linux'
-        run: ./build/cairn_tests 2>&1 | tail -20
 
   # The Android demo is the main target of the library, so it gets a real build on
   # every push and its APK is kept as an artifact.
