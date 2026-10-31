@@ -22,6 +22,8 @@
 #  include <ws2tcpip.h>
 #  define cairn_closesocket closesocket
 #  define cairn_last_socket_error() WSAGetLastError()
+/* MSVC has no ssize_t, and recvfrom returns int there. */
+typedef int cairn_sock_result;
 #else
 #  define _DEFAULT_SOURCE
 #  define _POSIX_C_SOURCE 200809L
@@ -31,6 +33,7 @@
 #  include <sys/time.h>
 #  include <unistd.h>
 #  define cairn_closesocket close
+typedef ssize_t cairn_sock_result;
 #endif
 
 #include "cairn/cairn.h"
@@ -212,7 +215,7 @@ static void pump_once(cairn_node *n)
     uint8_t buf[CAIRN_FRAME_MAX + CAIRN_FRAME_OVERHEAD];
     struct sockaddr_in from;
     socklen_t fromlen = sizeof from;
-    ssize_t got;
+    cairn_sock_result got;
     cairn_engine_outbox reply;
     cairn_frame f;
     size_t used = 0;

@@ -51,15 +51,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Accept the SDK licences
-        # sdkmanager refuses to install anything until every licence is accepted, and
-        # the runner image does not do it for us.
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
-
       - name: Install NDK and CMake
+        # The runner image ships an Android SDK, so the setup action is not needed and
+        # its licence prompt is exactly what made this job fail. sdkmanager is called
+        # directly, with the licences accepted first.
         run: |
+          if ! command -v sdkmanager > /dev/null; then
+            echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          fi
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" \
             "platforms;android-34" "build-tools;34.0.0"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
