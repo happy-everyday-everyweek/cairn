@@ -56,10 +56,6 @@ typedef ssize_t cairn_sock_result;
 #define BEACON_MAGIC0 0xCA
 #define BEACON_MAGIC1 0x17
 
-/* Loopback as a literal, because INADDR_LOOPBACK is not visible under the feature
- * macros used above on every libc. */
-#define CAIRN_LOOPBACK_ADDR 0x7f000001u
-
 /* One poll slice: short enough that a caller's loop stays responsive, long enough
  * not to spin the CPU. */
 #define POLL_SLICE_MS 20
@@ -76,8 +72,10 @@ struct cairn_node {
 
     int fd;          /* data: ephemeral port */
     int beacon_fd;   /* discovery: fixed port, shared */
-    struct sockaddr_in peer_addr;
+    struct sockaddr_in peer_addr;    /* where frames go */
     int have_peer_addr;
+    struct sockaddr_in beacon_addr;  /* where a reply beacon goes */
+    int have_beacon_addr;
 
     /* The code currently in use, as a string, so it survives a reconnect. */
     char code[CODE_MAX + 1];
@@ -116,17 +114,16 @@ static int transmit(cairn_node *n, const void *data, size_t len)
 
 /* Sends our beacon out.
  *
- * Two destinations, because one is not enough:
+ * Three destinations, each covering a case the others cannot:
  *
- *   the discovery port, so a device that has never heard of us can find us. That is
- *   the address a listener binds.
- *   the peer we last heard from, so a device that is already talking to us keeps
- *   receiving even when broadcast is filtered, which is the normal case on a phone
- *   with several interfaces and the only case that works on loopback.
- *
- * Sending to the remembered peer directly is what makes two instances on one machine
- * find each other: both broadcast, both hear nothing useful on loopback, but each has
- * the other's address from the packets that did arrive.
+ *   the subnet broadcast, so a device we have never met can find us. This is the
+ *   normal discovery path on a LAN.
+ *   the discovery address we last heard a beacon from, so a node whose discovery
+ *   socket landed on an ephemeral port still learns about us. Two instances on one
+ *   machine end up in exactly that situation, because only one of them can own the
+ *   fixed port.
+ *   the peer's data port once a conversation exists, which is the path that survives
+ *   a network that filters broadcast.
  */
 static void beacon_broadcast(cairn_node *n)
 {
@@ -136,23 +133,33 @@ static void beacon_broadcast(cairn_node *n)
 
     if (cairn_engine_beacon(&n->engine, buf, sizeof buf, &len) != CAIRN_OK) return;
 
-    memset(&dst, 0, sizeof dst);
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(DISCOVERY_PORT);
-
-    /* Broadcast on the subnet, and on loopback so two processes on one machine can
-     * find each other. Both go through the discovery socket, which is the one bound to
-     * the port a listener is watching. */
     if (n->beacon_fd >= 0) {
+        memset(&dst, 0, sizeof dst);
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(DISCOVERY_PORT);
         dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-        (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
-        dst.sin_addr.s_addr = htonl(CAIRN_LOOPBACK_ADDR);
         (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
     }
 
-    /* And straight to the peer we already know, which is the reliable path once a
-     * conversation has started. */
+    if (n->have_beacon_addr)
+        (void)sendto(n->beacon_fd, buf, len, 0,
+                     (struct sockaddr *)&n->beacon_addr, sizeof n->beacon_addr);
+
     if (n->have_peer_addr) (void)raw_send_to(n, buf, len, &n->peer_addr);
+}
+
+/* Records where a beacon came from. Two addresses, because they mean different things:
+ * the source is where a reply beacon goes, and the advertised port is where frames go.
+ * Conflating them was a bug that pointed every KEY frame at the discovery port. */
+static void remember_beacon_sender(cairn_node *n, const struct sockaddr_in *from,
+                                   const cairn_beacon *b)
+{
+    n->beacon_addr = *from;
+    n->have_beacon_addr = 1;
+
+    n->peer_addr = *from;
+    n->peer_addr.sin_port = htons(b->port);
+    n->have_peer_addr = 1;
 }
 
 static int first_ready_index(const cairn_node *n)
@@ -235,10 +242,7 @@ static void pump_once(cairn_node *n)
 
                 if (cairn_beacon_decode(&b, buf, (size_t)got) == CAIRN_OK &&
                     memcmp(b.id, n->engine.beacon.id, CAIRN_ID_BYTES) != 0) {
-                    /* Answer on the port the beacon advertises, which is where that
-                     * device's data socket lives, not the discovery port. */
-                    from.sin_port = htons(b.port);
-                    remember_peer_addr(n, &from);
+                    remember_beacon_sender(n, &from, &b);
                     cairn_engine_on_beacon(&n->engine, buf, (size_t)got, now_ms());
                 }
                 /* A beacon from ourselves is dropped whole, address included. Recording
@@ -265,8 +269,7 @@ static void pump_once(cairn_node *n)
                  * reason given above. */
                 if (cairn_beacon_decode(&b, buf, (size_t)got) == CAIRN_OK &&
                     memcmp(b.id, n->engine.beacon.id, CAIRN_ID_BYTES) != 0) {
-                    from.sin_port = htons(b.port);
-                    remember_peer_addr(n, &from);
+                    remember_beacon_sender(n, &from, &b);
                     cairn_engine_on_beacon(&n->engine, buf, (size_t)got, now_ms());
                 }
             } else {
@@ -343,10 +346,10 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
         setsockopt(n->fd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
         set_recv_timeout(n->fd, POLL_SLICE_MS);
 
-#ifdef SO_REUSEPORT
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&one, sizeof one);
-#endif
-        setsockopt(n->beacon_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        /* The discovery socket deliberately does not set SO_REUSEPORT. Sharing the port
+         * between two nodes makes delivery of a given packet depend on which socket the
+         * kernel picks, and on some platforms a broadcast then reaches only one of them.
+         * One owner plus unicast replies is deterministic on every platform. */
         setsockopt(n->beacon_fd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
         set_recv_timeout(n->beacon_fd, POLL_SLICE_MS);
     }
@@ -363,8 +366,16 @@ cairn_node *cairn_open(const char *name, const cairn_io *io)
      */
     bind_addr.sin_port = htons(DISCOVERY_PORT);
     if (bind(n->beacon_fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) {
-        cairn_closesocket(n->beacon_fd);
-        n->beacon_fd = -1;
+        /* Somebody else on this machine already owns the discovery port. Fall back to
+         * an ephemeral one: the node that does own it will answer our broadcast with a
+         * unicast beacon, and from then on both sides know where to send. Trying to
+         * share the port instead would make delivery a lottery, which is exactly the
+         * failure this avoids. */
+        bind_addr.sin_port = 0;
+        if (bind(n->beacon_fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) {
+            cairn_closesocket(n->beacon_fd);
+            n->beacon_fd = -1;
+        }
     }
 
     /* The beacon must advertise the data port, not the discovery port: that is where a

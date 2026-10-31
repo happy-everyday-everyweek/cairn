@@ -63,16 +63,13 @@ option(CAIRN_BUILD_TESTS "Build the test binary" ON)
 if(CAIRN_BUILD_TESTS)
     file(GLOB CAIRN_TEST_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.c)
 
-    # The two-node pairing test runs two nodes on one machine, which means two sockets
-# bound to the same discovery port. Linux delivers broadcasts to all of them; macOS
-# SO_REUSEPORT hands each packet to one socket only, so the test cannot pass there
-# even though two real devices would pair fine. It stays a Linux integration check,
-# and the pairing decisions themselves are covered by tests/test_pair_logic.c
-# everywhere.
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(REMOVE_ITEM CAIRN_TEST_SRC
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pair_live.c)
-endif()
+    # The two-node pairing test needs pthreads and two sockets on one host. Windows has
+    # no pthreads, so it is skipped there; every other platform runs it, and the pairing
+    # decisions themselves are covered by tests/test_pair_logic.c everywhere.
+    if(WIN32)
+        list(REMOVE_ITEM CAIRN_TEST_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pair_live.c)
+    endif()
 
     add_executable(cairn_tests ${CAIRN_TEST_SRC})
     target_link_libraries(cairn_tests PRIVATE cairn)

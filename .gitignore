@@ -31,3 +31,7 @@ android/.idea/
 
 # Agent backup directory
 .backup/
+
+# Local helper for pushing through the GitHub API when the git port is blocked.
+# It holds a token, so it must never be committed.
+push_api.py
