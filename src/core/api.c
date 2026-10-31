@@ -137,7 +137,16 @@ static void beacon_broadcast(cairn_node *n)
         memset(&dst, 0, sizeof dst);
         dst.sin_family = AF_INET;
         dst.sin_port = htons(DISCOVERY_PORT);
+
+        /* The subnet, for devices we have never met. */
         dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
+
+        /* Loopback, for another instance on this machine. This is a unicast to the
+         * discovery port, which is deterministic precisely because only one node may
+         * own that port; relying on broadcast being looped back to local sockets is
+         * what made same-host pairing work on one machine and not another. */
+        dst.sin_addr.s_addr = htonl(0x7f000001u);
         (void)sendto(n->beacon_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
     }
 

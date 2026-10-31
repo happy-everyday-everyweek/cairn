@@ -77,6 +77,12 @@ if(CAIRN_BUILD_TESTS)
     target_link_libraries(cairn_tests PRIVATE Threads::Threads)
     target_include_directories(cairn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+    # Tells test_main.c not to register the test that was just excluded, which would
+    # otherwise fail to link.
+    if(WIN32)
+        target_compile_definitions(cairn_tests PRIVATE CAIRN_NO_LIVE_PAIR=1)
+    endif()
+
     enable_testing()
     add_test(NAME cairn_tests COMMAND cairn_tests)
 endif()

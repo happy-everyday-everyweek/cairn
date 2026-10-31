@@ -52,17 +52,19 @@ jobs:
           java-version: '17'
 
       - name: Install NDK and CMake
-        # The runner image ships an Android SDK, so the setup action is not needed and
-        # its licence prompt is exactly what made this job fail. sdkmanager is called
-        # directly, with the licences accepted first.
+        # The runner image ships an Android SDK. sdkmanager is called with an explicit
+        # path because appending to GITHUB_PATH only affects later steps, and that made
+        # the previous attempt fail with "command not found".
         run: |
-          if ! command -v sdkmanager > /dev/null; then
-            echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          fi
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$PATH"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" \
             "platforms;android-34" "build-tools;34.0.0"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
 
       - uses: gradle/actions/setup-gradle@v4
         with:

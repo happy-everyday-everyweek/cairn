@@ -49,9 +49,12 @@ void ct_reg_discovery(void);
 void ct_reg_bundle(void);
 void ct_reg_pair(void);
 void ct_reg_facade(void);
+#ifndef CAIRN_NO_LIVE_PAIR
+/* The two-node test needs two sockets and threads on one host, which Windows cannot
+ * provide through this build. Everything else runs everywhere. */
 void ct_reg_pair_live(void);
+#endif
 void ct_reg_pair_logic(void);
-
 int main(void)
 {
     int i, pass = 0;
@@ -75,7 +78,9 @@ int main(void)
     ct_reg_bundle();
     ct_reg_pair();
     ct_reg_facade();
+#ifndef CAIRN_NO_LIVE_PAIR
     ct_reg_pair_live();
+#endif
     ct_reg_pair_logic();
     fprintf(stderr, "%d cases\n", g_count);
 
