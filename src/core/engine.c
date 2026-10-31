@@ -194,29 +194,42 @@ int cairn_engine_connect(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
 {
     uint8_t hello[CAIRN_HELLO_BYTES];
     cairn_pubkey self;
+    cairn_engine_peer *p;
     int idx, rc;
 
     (void)now_ms;
     if (n == NULL || peer_id == NULL || !n->started) return CAIRN_ERR_ARG;
 
     idx = peer_index(n, peer_id);
-    if (idx < 0 || n->peers[idx].state != CAIRN_ENGINE_KNOWN) return CAIRN_ERR_STATE;
+    if (idx < 0) return CAIRN_ERR_STATE;
+    p = &n->peers[idx];
+
+    /* A handshake we already started is retransmitted, not restarted. The stored
+     * bytes matter: cairn_session_init would derive a fresh init secret, and the
+     * responder's ACCEPT is only valid for the blob it actually answered. */
+    if (p->state == CAIRN_ENGINE_HANDSHAKING && p->initiated &&
+        p->hello_len == sizeof hello)
+        return emit(out, CAIRN_FRAME_HELLO, p->hello, p->hello_len);
+
+    if (p->state != CAIRN_ENGINE_KNOWN) return CAIRN_ERR_STATE;
     /* A slot seen only in a beacon has no public key; a handshake against zeroes would
      * fail deep inside X25519 instead of here. */
-    if (!n->peers[idx].has_key) return CAIRN_ERR_STATE;
+    if (!p->has_key) return CAIRN_ERR_STATE;
 
-    rc = cairn_session_init(&n->peers[idx].session, &n->identity, &n->peers[idx].key,
+    rc = cairn_session_init(&p->session, &n->identity, &p->key,
                             hello + CAIRN_PUBKEY_BYTES);
     if (rc != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_ENGINE_FAILED;
+        p->state = CAIRN_ENGINE_FAILED;
         return rc;
     }
 
     cairn_identity_pubkey(&n->identity, &self);
     cairn_pubkey_encode(hello, &self);
 
-    n->peers[idx].state = CAIRN_ENGINE_HANDSHAKING;
-    n->peers[idx].initiated = 1;
+    memcpy(p->hello, hello, sizeof hello);
+    p->hello_len = sizeof hello;
+    p->state = CAIRN_ENGINE_HANDSHAKING;
+    p->initiated = 1;
     return emit(out, CAIRN_FRAME_HELLO, hello, sizeof hello);
 }
 
@@ -279,8 +292,20 @@ cairn_pair_action cairn_pair_next(const cairn_pair_view *v)
 
     if (!v->has_key) return v->key_due ? CAIRN_PAIR_SEND_KEY : CAIRN_PAIR_IDLE;
 
-    if (v->peer_state == CAIRN_ENGINE_KNOWN && v->we_initiate && v->hello_due)
-        return CAIRN_PAIR_SEND_HELLO;
+    if (v->peer_state == CAIRN_ENGINE_KNOWN) {
+        if (v->we_initiate && v->hello_due) return CAIRN_PAIR_SEND_HELLO;
+        return CAIRN_PAIR_IDLE;
+    }
+
+    /* A handshake in flight is retransmitted, not restarted. Without this a single
+     * lost HELLO or ACCEPT left both sides waiting until the timeout expired, which
+     * is what made pairing succeed on one run and fail on the next. Both
+     * retransmissions are idempotent: the HELLO is resent byte for byte, and the
+     * ACCEPT is rebuilt from the session the responder already holds. */
+    if (v->peer_state == CAIRN_ENGINE_HANDSHAKING) {
+        if (v->we_initiate) return v->hello_due ? CAIRN_PAIR_SEND_HELLO : CAIRN_PAIR_IDLE;
+        return v->accept_due ? CAIRN_PAIR_SEND_ACCEPT : CAIRN_PAIR_IDLE;
+    }
 
     return CAIRN_PAIR_IDLE;
 }
@@ -306,14 +331,35 @@ static void phase_label(char out[32], const cairn_engine_peer *p, const char *ph
     snprintf(out, 32, "%s|%s", phase, p->code);
 }
 
+/* Rebuilds the ACCEPT reply from the session the responder already holds. Used both
+ * for the first answer and for every retransmission, so a lost ACCEPT can never
+ * leave the initiator waiting for a reply that will not come again. */
+static int emit_accept(const cairn_engine_peer *p, cairn_engine_outbox *out)
+{
+    uint8_t accept[CAIRN_ACCEPT_BYTES];
+    char label[32];
+    int rc;
+
+    memcpy(accept, p->session.send_dh_pub, CAIRN_HANDSHAKE_RESP_BYTES);
+    phase_label(label, p, "accept");
+    rc = cairn_session_confirm_tag(accept + CAIRN_HANDSHAKE_RESP_BYTES, &p->session, label);
+    if (rc != CAIRN_OK) return rc;
+    return emit(out, CAIRN_FRAME_ACCEPT, accept, sizeof accept);
+}
+
 /* Applies a HELLO: binds the sender's key and parks the responder side of the
- * handshake. Shared by cairn_engine_on_frame and cairn_engine_accept. */
+ * handshake. Shared by cairn_engine_on_frame and cairn_engine_accept.
+ *
+ * A repeated HELLO is answered from the session already bound, not by running the
+ * responder again. Re-running it would mint a new ephemeral and a new root, while the
+ * initiator is still holding the keys derived from its original blob; the two sides
+ * would then disagree forever. */
 static int handle_hello(cairn_engine *n, const uint8_t *payload, size_t len,
                         cairn_engine_outbox *out)
 {
     cairn_pubkey peer_pk;
-    uint8_t accept[CAIRN_ACCEPT_BYTES];
-    char label[32];
+    cairn_engine_peer *p;
+    uint8_t ephemeral[CAIRN_HANDSHAKE_RESP_BYTES];
     int idx, rc;
 
     if (payload == NULL || len != CAIRN_HELLO_BYTES) return CAIRN_ERR_FORMAT;
@@ -321,39 +367,42 @@ static int handle_hello(cairn_engine *n, const uint8_t *payload, size_t len,
     rc = cairn_pubkey_decode(&peer_pk, payload);
     if (rc != CAIRN_OK) return rc;
 
-    idx = peer_slot(n, peer_pk.id);
-    if (idx < 0) return idx;
+    idx = peer_index(n, peer_pk.id);
+    if (idx >= 0) {
+        p = &n->peers[idx];
+        /* Already established: a late duplicate is harmless and must not disturb it. */
+        if (p->state == CAIRN_ENGINE_READY) return CAIRN_OK;
+        if (p->state == CAIRN_ENGINE_HANDSHAKING && !p->initiated &&
+            p->session.established)
+            return emit_accept(p, out);
+    } else {
+        idx = peer_slot(n, peer_pk.id);
+        if (idx < 0) return idx;
+    }
+    p = &n->peers[idx];
 
     /* Trust on first use: the key in the HELLO replaces whatever we had, but only
      * while the channel is not established. */
-    if (n->peers[idx].state == CAIRN_ENGINE_READY) return CAIRN_ERR_STATE;
-    n->peers[idx].key = peer_pk;
+    p->key = peer_pk;
 
-    rc = cairn_session_respond(&n->peers[idx].session, &n->identity, accept,
+    rc = cairn_session_respond(&p->session, &n->identity, ephemeral,
                                payload + CAIRN_PUBKEY_BYTES,
                                len - CAIRN_PUBKEY_BYTES);
     if (rc != CAIRN_OK) {
-        n->peers[idx].state = CAIRN_ENGINE_FAILED;
+        p->state = CAIRN_ENGINE_FAILED;
         return rc;
     }
 
-    phase_label(label, &n->peers[idx], "accept");
-    rc = cairn_session_confirm_tag(accept + CAIRN_HANDSHAKE_RESP_BYTES,
-                                   &n->peers[idx].session, label);
-    if (rc != CAIRN_OK) return rc;
-
-    n->peers[idx].state = CAIRN_ENGINE_HANDSHAKING;
-    n->peers[idx].initiated = 0;
-    return emit(out, CAIRN_FRAME_ACCEPT, accept, sizeof accept);
+    p->state = CAIRN_ENGINE_HANDSHAKING;
+    p->initiated = 0;
+    return emit_accept(p, out);
 }
 
 int cairn_engine_accept(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
                       uint32_t now_ms, cairn_engine_outbox *out)
 {
     cairn_engine_peer *p;
-    uint8_t accept[CAIRN_ACCEPT_BYTES];
-    char label[32];
-    int idx, rc;
+    int idx;
 
     (void)now_ms;
     if (n == NULL || peer_id == NULL || !n->started) return CAIRN_ERR_ARG;
@@ -366,12 +415,7 @@ int cairn_engine_accept(cairn_engine *n, const uint8_t peer_id[CAIRN_ID_BYTES],
 
     /* Rebuild the reply from the live session: the peer ephemeral already sits in
      * the session, so re-encoding it is enough. */
-    memcpy(accept, p->session.send_dh_pub, CAIRN_HANDSHAKE_RESP_BYTES);
-    phase_label(label, p, "accept");
-    rc = cairn_session_confirm_tag(accept + CAIRN_HANDSHAKE_RESP_BYTES,
-                                   &p->session, label);
-    if (rc != CAIRN_OK) return rc;
-    return emit(out, CAIRN_FRAME_ACCEPT, accept, sizeof accept);
+    return emit_accept(p, out);
 }
 
 /* Finds the single peer waiting on an ACCEPT, which is the one we initiated. */
@@ -400,12 +444,24 @@ static int handle_accept(cairn_engine *n, const uint8_t *payload, size_t len,
 {
     uint8_t tag[CAIRN_TAG_BYTES];
     char label[32];
-    int idx, rc;
+    int idx, rc, i;
 
     if (payload == NULL || len != CAIRN_ACCEPT_BYTES) return CAIRN_ERR_FORMAT;
 
     idx = find_initiating_peer(n);
-    if (idx < 0) return CAIRN_ERR_STATE;
+    if (idx < 0) {
+        /* No handshake of ours is in flight, so this is a repeated ACCEPT: the
+         * responder is still waiting for our confirmation, which means the ACK we
+         * sent was lost. Rebuild it from the session we already hold. */
+        for (i = 0; i < CAIRN_NODE_MAX_SESSIONS; i++)
+            if (n->peers[i].state == CAIRN_ENGINE_READY && n->peers[i].confirmed) break;
+        if (i == CAIRN_NODE_MAX_SESSIONS) return CAIRN_ERR_STATE;
+
+        phase_label(label, &n->peers[i], "confirm");
+        rc = cairn_session_confirm_tag(tag, &n->peers[i].session, label);
+        if (rc != CAIRN_OK) return rc;
+        return emit(out, CAIRN_FRAME_ACK, tag, sizeof tag);
+    }
 
     rc = cairn_session_finish(&n->peers[idx].session, payload,
                               CAIRN_HANDSHAKE_RESP_BYTES);

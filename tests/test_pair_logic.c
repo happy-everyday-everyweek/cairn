@@ -19,6 +19,9 @@ static cairn_pair_view view(int state, int has_key, int we_initiate, int key_due
     v.we_initiate = we_initiate;
     v.key_due = key_due;
     v.hello_due = hello_due;
+    /* Due by default, so a case that does not care about the responder timer does not
+     * have to mention it. The tests that do care set it explicitly. */
+    v.accept_due = 1;
     return v;
 }
 
@@ -78,15 +81,30 @@ CT_TEST(pair_next_hello_needs_both_keys_and_initiator)
     CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_IDLE);
 }
 
-/* While a handshake is in flight nothing new should be started; the caller owns
- * retransmission of that phase. A peer we still lack a key for is the exception. */
-CT_TEST(pair_next_silent_while_handshaking)
+/* A handshake already in flight is retransmitted, never restarted and never
+ * abandoned. Leaving it silent is what turned one lost datagram into a pairing
+ * attempt that could only end in a timeout. */
+CT_TEST(pair_next_retransmits_handshake_in_flight)
 {
     cairn_pair_view v;
 
+    /* The initiator resends its HELLO on its own timer. */
     v = view(CAIRN_ENGINE_HANDSHAKING, 1, 1, 1, 1);
+    CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_SEND_HELLO);
+
+    /* Not due yet. */
+    v = view(CAIRN_ENGINE_HANDSHAKING, 1, 1, 1, 0);
     CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_IDLE);
 
+    /* The responder resends its ACCEPT, because the initiator has no way to ask. */
+    v = view(CAIRN_ENGINE_HANDSHAKING, 1, 0, 0, 0);
+    CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_SEND_ACCEPT);
+
+    v.accept_due = 0;
+    CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_IDLE);
+
+    /* A peer we still lack a key for is the exception: publishing our key comes
+     * first regardless of the phase. */
     v = view(CAIRN_ENGINE_HANDSHAKING, 0, 0, 1, 1);
     CT_ASSERT_EQ_INT(cairn_pair_next(&v), CAIRN_PAIR_SEND_KEY);
 }
@@ -130,7 +148,7 @@ void ct_reg_pair_logic(void)
     CT_REG(pair_next_sends_key_when_key_missing);
     CT_REG(pair_next_waits_for_key_timer);
     CT_REG(pair_next_hello_needs_both_keys_and_initiator);
-    CT_REG(pair_next_silent_while_handshaking);
+    CT_REG(pair_next_retransmits_handshake_in_flight);
     CT_REG(pair_next_retries_after_failure);
     CT_REG(pair_next_roles_are_complementary);
     CT_REG(pair_next_null_is_idle);

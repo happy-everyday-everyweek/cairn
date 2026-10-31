@@ -88,6 +88,11 @@ typedef struct {
      * which case the labels fall back to their bare form. */
     char code[13];
     int notified;
+    /* The HELLO we sent as initiator, kept so it can be retransmitted byte for
+     * byte. Rebuilding it would derive a new init secret, and the responder's
+     * reply is only valid for the blob it answered. */
+    uint8_t hello[CAIRN_HELLO_BYTES];
+    size_t hello_len;
 } cairn_engine_peer;
 
 typedef struct {
@@ -173,7 +178,8 @@ int cairn_engine_peer_status(const cairn_engine *n, const uint8_t peer_id[CAIRN_
 typedef enum {
     CAIRN_PAIR_IDLE = 0,     /* nothing to do this pass */
     CAIRN_PAIR_SEND_KEY,     /* we still lack their key, so send ours */
-    CAIRN_PAIR_SEND_HELLO    /* both keys held, and we are the initiator */
+    CAIRN_PAIR_SEND_HELLO,   /* both keys held, and we are the initiator */
+    CAIRN_PAIR_SEND_ACCEPT   /* we are the responder and our ACCEPT may be lost */
 } cairn_pair_action;
 
 typedef struct {
@@ -182,6 +188,7 @@ typedef struct {
     int we_initiate;  /* our device id sorts lower, so HELLO is ours to send */
     int key_due;      /* the key retransmit timer has elapsed */
     int hello_due;    /* the HELLO retransmit timer has elapsed */
+    int accept_due;   /* the ACCEPT retransmit timer has elapsed */
 } cairn_pair_view;
 
 /* Returns what to send for this peer, or IDLE. */

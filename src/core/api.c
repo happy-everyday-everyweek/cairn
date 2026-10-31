@@ -491,6 +491,7 @@ static int pair_loop(cairn_node *n, uint32_t deadline)
     uint32_t last_beacon = 0;
     uint32_t last_key = 0;
     uint32_t last_hello = 0;
+    uint32_t last_accept = 0;
 
     while ((int32_t)(deadline - now_ms()) > 0) {
         cairn_engine_outbox out;
@@ -527,6 +528,9 @@ static int pair_loop(cairn_node *n, uint32_t deadline)
             view.we_initiate = memcmp(n->engine.beacon.id, p->id, CAIRN_ID_BYTES) < 0;
             view.key_due = (last_key == 0 || (uint32_t)(now_ms() - last_key) > 400);
             view.hello_due = (last_hello == 0 || (uint32_t)(now_ms() - last_hello) > 600);
+            /* The responder retransmits sooner, because its reply is the one the
+             * initiator cannot ask for again on its own. */
+            view.accept_due = (last_accept == 0 || (uint32_t)(now_ms() - last_accept) > 200);
 
             switch (cairn_pair_next(&view)) {
             case CAIRN_PAIR_SEND_KEY:
@@ -542,6 +546,14 @@ static int pair_loop(cairn_node *n, uint32_t deadline)
                 if (cairn_engine_connect(&n->engine, p->id, now_ms(), &out) == CAIRN_OK)
                     (void)transmit(n, out.buf, out.len);
                 last_hello = now_ms();
+                break;
+
+            case CAIRN_PAIR_SEND_ACCEPT:
+                memset(&out, 0, sizeof out);
+                if (cairn_engine_accept(&n->engine, p->id, now_ms(), &out) == CAIRN_OK &&
+                    out.len > 0)
+                    (void)transmit(n, out.buf, out.len);
+                last_accept = now_ms();
                 break;
 
             case CAIRN_PAIR_IDLE:
