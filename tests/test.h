@@ -10,8 +10,19 @@ typedef void (*ct_fn)(void);
 void ct_register(const char *name, ct_fn fn);
 void ct_failf(const char *file, int line, const char *fmt, ...);
 
+/* Marks the current case as not applicable here instead of failed. Used when the
+ * case needs something the environment cannot provide, such as UDP loopback between
+ * two sockets; pretending it passed would be worse than saying so. */
+void ct_skip(const char *reason);
+
 #define CT_TEST(fn) static void fn(void)
 #define CT_REG(fn) ct_register(#fn, fn)
+
+#define CT_SKIP(reason)                                                       \
+    do {                                                                      \
+        ct_skip(reason);                                                      \
+        return;                                                               \
+    } while (0)
 
 #define CT_ASSERT(cond)                                                       \
     do {                                                                      \

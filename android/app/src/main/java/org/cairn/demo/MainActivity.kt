@@ -1,5 +1,6 @@
 package org.cairn.demo
 
+import android.app.Activity
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Bundle
@@ -10,17 +11,17 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
 import java.nio.charset.StandardCharsets
 
 /**
  * The demo: type a code on two phones, tap Pair, then send text or a file.
  *
- * Everything protocol shaped is one native call. What is left here is a code field, a
- * log view, two worker threads (one to pair, one to pump), and a multicast lock, which
- * some devices need before they will deliver broadcast packets to an app.
+ * It extends the platform Activity rather than AppCompat, so the demo depends on
+ * nothing outside the framework. Everything protocol shaped is one native call; what
+ * is left here is a code field, a log view, two worker threads, and a multicast lock,
+ * which some devices need before they will deliver broadcast packets to an app.
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     private lateinit var logView: TextView
     private lateinit var codeField: EditText
@@ -33,7 +34,10 @@ class MainActivity : AppCompatActivity() {
     private val ui = Handler(Looper.getMainLooper())
     private var multicastLock: WifiManager.MulticastLock? = null
 
-    private val eventSink = object {
+    /** The three callbacks the native side looks up by name. */
+    private val events = Events()
+
+    private inner class Events {
         @Suppress("unused")
         fun onMessage(data: ByteArray) {
             print("message: ${String(data, StandardCharsets.UTF_8)}")
@@ -56,7 +60,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         takeMulticastLock()
 
-        handle = Cairn.nativeOpen(deviceName(), eventSink)
+        handle = Cairn.nativeOpen(deviceName(), events)
         if (handle == 0L) {
             print("cannot open a node")
             return
@@ -152,9 +156,7 @@ class MainActivity : AppCompatActivity() {
             print("paired, waiting for traffic")
             ui.post { statusView.text = getString(R.string.status_ready) }
 
-            while (running) {
-                Cairn.nativePoll(handle, POLL_SLICE_MS)
-            }
+            while (running) Cairn.nativePoll(handle, POLL_SLICE_MS)
         }.also { it.name = "cairn-pair"; it.start() }
     }
 
@@ -171,8 +173,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendFile() {
         if (!pairReady()) return
 
-        val total = FILE_BYTES
-        val rc = Cairn.nativeSendFile(handle, total)
+        val rc = Cairn.nativeSendFile(handle, FILE_BYTES)
         if (rc != Cairn.OK) {
             print("offer failed: ${Cairn.nativeError(rc)}")
             return

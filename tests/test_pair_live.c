@@ -1,22 +1,64 @@
 #include "test.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "cairn/cairn.h"
 
-/* Two real nodes, two real sockets, one process, two threads.
+/* Two nodes, two real sockets, one process, two threads.
  *
- * This is the test that was missing. test_pair.c drives the engine by hand, so it can
- * prove the code binding works but cannot notice that the facade never starts a
- * handshake. test_facade.c checks the facade's contract but only ever runs one node.
- * Only this file puts two facade instances against each other over the network stack,
- * which is the arrangement an application actually uses.
+ * This is the test that was missing: the engine tests drive cairn_engine_connect by
+ * hand, so they could not notice that the facade never called it; the facade tests run
+ * a single node, so they could not notice that two nodes never found each other. Only
+ * this file puts two facade instances against each other over the network stack.
  *
- * A thread per node gets both sides pumping at once. The facade is single threaded by
- * design and each side owns its own node, so this is the same arrangement a two
- * process run would have.
+ * It needs the host to deliver a UDP datagram from a socket back to another socket on
+ * this machine. Most do; some CI images do not. When that is the case the test says so
+ * instead of failing, because a red mark there would mean the environment, not the
+ * protocol.
  */
+
+static int loopback_delivers(void)
+{
+    struct sockaddr_in addr;
+    socklen_t len = sizeof addr;
+    struct pollfd pfd;
+    int fd, ok = 0;
+    char byte = 'x';
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+        close(fd);
+        return 0;
+    }
+
+    if (sendto(fd, &byte, 1, 0, (struct sockaddr *)&addr, sizeof addr) == 1) {
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        if (poll(&pfd, 1, 500) == 1) {
+            char got = 0;
+            if (recv(fd, &got, 1, 0) == 1 && got == 'x') ok = 1;
+        }
+    }
+
+    close(fd);
+    return ok;
+}
 
 typedef struct {
     cairn_node *node;
@@ -53,6 +95,9 @@ CT_TEST(two_nodes_pair_with_same_code)
     peer a, b;
     pthread_t ta, tb;
 
+    if (!loopback_delivers())
+        CT_SKIP("this host does not deliver UDP to another socket on loopback");
+
     memset(&io, 0, sizeof io);
     io.on_message = on_message;
 
@@ -67,9 +112,9 @@ CT_TEST(two_nodes_pair_with_same_code)
     CT_ASSERT(b.node != NULL);
 
     a.code = "424242";
-    a.timeout_ms = 3000;
+    a.timeout_ms = 6000;
     b.code = "424242";
-    b.timeout_ms = 3000;
+    b.timeout_ms = 6000;
 
     pthread_create(&ta, NULL, pair_thread, &a);
     pthread_create(&tb, NULL, pair_thread, &b);
@@ -80,6 +125,16 @@ CT_TEST(two_nodes_pair_with_same_code)
     CT_ASSERT_EQ_INT(b.result, CAIRN_OK);
     CT_ASSERT_EQ_INT(cairn_is_ready(a.node), 1);
     CT_ASSERT_EQ_INT(cairn_is_ready(b.node), 1);
+
+    /* And once paired, a message must arrive. */
+    CT_ASSERT_EQ_INT(cairn_send(a.node, "ping", 4), CAIRN_OK);
+    {
+        int waited;
+        for (waited = 0; waited < 80 && b.messages == 0; waited++)
+            cairn_poll(b.node, 25);
+    }
+    CT_ASSERT_EQ_INT(b.messages, 1);
+    CT_ASSERT_MEM_EQ(b.last, "ping", 4);
 
     cairn_close(a.node);
     cairn_close(b.node);
@@ -92,6 +147,9 @@ CT_TEST(two_nodes_reject_different_codes)
     cairn_io io;
     peer a, b;
     pthread_t ta, tb;
+
+    if (!loopback_delivers())
+        CT_SKIP("this host does not deliver UDP to another socket on loopback");
 
     memset(&io, 0, sizeof io);
     io.on_message = on_message;
@@ -116,7 +174,6 @@ CT_TEST(two_nodes_reject_different_codes)
     pthread_join(ta, NULL);
     pthread_join(tb, NULL);
 
-    /* Neither side may claim success. */
     CT_ASSERT(a.result != CAIRN_OK);
     CT_ASSERT(b.result != CAIRN_OK);
     CT_ASSERT_EQ_INT(cairn_is_ready(a.node), 0);

@@ -7,7 +7,6 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
-
 android {
     namespace = "org.cairn.demo"
     compileSdk = 34
@@ -63,6 +62,6 @@ android {
 }
 
 dependencies {
-    // Only for the activity base class; there is no other dependency in the demo.
-    implementation("androidx.appcompat:appcompat:1.7.0")
+    // Nothing. The demo extends the platform Activity and draws its own views, so the
+    // only code in the APK is the library and this app.
 }

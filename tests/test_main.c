@@ -10,7 +10,9 @@ static struct {
 } g_cases[CT_MAX];
 static int g_count;
 static int g_fail;
+static int g_skip;
 static int g_hit;
+static const char *g_skip_reason;
 
 void ct_register(const char *name, ct_fn fn)
 {
@@ -23,12 +25,18 @@ void ct_register(const char *name, ct_fn fn)
 void ct_failf(const char *file, int line, const char *fmt, ...)
 {
     va_list ap;
+
     g_hit = 1;
     fprintf(stderr, "  %s:%d: ", file, line);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+void ct_skip(const char *reason)
+{
+    g_skip_reason = reason;
 }
 
 void ct_reg_blake2b(void);
@@ -87,15 +95,20 @@ int main(void)
     for (i = 0; i < g_count; i++) {
         fprintf(stderr, "run %d %s\n", i, g_cases[i].name);
         g_hit = 0;
+        g_skip_reason = NULL;
         g_cases[i].fn();
         if (g_hit) {
             g_fail++;
             fprintf(stderr, "FAIL %s\n", g_cases[i].name);
+        } else if (g_skip_reason != NULL) {
+            g_skip++;
+            printf("SKIP %s: %s\n", g_cases[i].name, g_skip_reason);
         } else {
             pass++;
         }
     }
 
-    printf("\n%d passed, %d failed, %d total\n", pass, g_fail, g_count);
+    printf("\n%d passed, %d failed, %d skipped, %d total\n",
+           pass, g_fail, g_skip, g_count);
     return g_fail == 0 ? 0 : 1;
 }
